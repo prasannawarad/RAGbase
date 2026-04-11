@@ -2,8 +2,6 @@
 
 > A production-grade Retrieval-Augmented Generation (RAG) platform with hybrid search (BM25 + vector), streaming AI responses, and Supabase-backed persistence.
 
-![RAGBase UI](./public/screenshot.png)
-
 ---
 
 ## 🧠 Overview
