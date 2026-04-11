@@ -1,232 +1,211 @@
-# RAGBase
+# 🚀 RAGBase
 
-> A production-grade RAG system with hybrid search (BM25 + vector), streaming AI responses, and Supabase-backed persistence.
+> A production-grade Retrieval-Augmented Generation (RAG) platform with hybrid search (BM25 + vector), streaming AI responses, and Supabase-backed persistence.
 
-Upload documents, embed them into Postgres + pgvector, retrieve with hybrid search, and chat over your knowledge base with streaming answers and source attribution.
-
----
-
-## Demo
-
-RAGBase is a full-stack reference implementation: **chunk → embed → persist → retrieve → generate**. The UI covers upload, document management, hybrid Q&A with citations, a chunk inspector, and analytics — suitable as a portfolio piece or starting point for a document intelligence product.
+![RAGBase UI](./public/screenshot.png)
 
 ---
 
-## Why this project
+## 🧠 Overview
 
-Most RAG demos rely purely on vector search and thin client-side glue.
+RAGBase is a full-stack document intelligence system that lets you:
 
-RAGBase implements a **production-style architecture**:
+* Upload documents
+* Convert them into embeddings
+* Store them in a vector database
+* Retrieve relevant context using hybrid search
+* Generate streaming AI responses with source attribution
 
-- Server-owned embedding pipelines
-- Hybrid retrieval (BM25 + vector + RRF)
-- Streaming LLM responses with fallback handling
-- Persistent vector storage with pgvector
-- Source attribution and inspectable chunks
-
-That puts it closer to real-world systems like Perplexity, Glean, or internal enterprise search — not a notebook demo.
+This project is designed to reflect **real-world RAG system architecture**, not just a demo.
 
 ---
 
-## Features
+## 🎯 Why this project
 
-- **Multi-format upload** — PDF (client-side extraction), TXT, MD, CSV; batch-friendly
-- **Sentence-aware chunking** — configurable size and overlap on the client before ingest
-- **Server-side pipeline** — `POST /api/ingest` embeds (Gemini) and persists to Supabase
-- **Hybrid retrieval** — BM25 + vector similarity fused with **Reciprocal Rank Fusion (RRF)**
-- **Streaming chat** — SSE-style streaming from `/api/chat` into the UI
-- **Source attribution** — answers cite document and chunk; jump-to-chunk from chat
-- **Chunk inspector** — browse chunks per document; hybrid search within the inspector
-- **Analytics** — query log, confidence, and document-level summaries (JSON mode)
-- **Durable storage** — documents and vectors in Supabase; cascade delete for cleanup
-- **Resilient API layer** — embedding/chat fallbacks and defensive client handling for failed routes
+Most RAG examples rely only on vector search and client-side logic.
 
----
+RAGBase implements a **production-style pipeline**:
 
-## Tech Stack
+* Server-side embedding generation
+* Hybrid retrieval (BM25 + vector + RRF)
+* Streaming LLM responses with fallback handling
+* Persistent vector storage (pgvector)
+* Source attribution with chunk-level inspection
 
-| Layer | Technology |
-|--------|------------|
-| Framework | **Next.js 15** (App Router), **React 19**, **TypeScript** |
-| Database | **Supabase** (PostgreSQL + **pgvector**) |
-| Embeddings & LLM | **Google Gemini** (e.g. text-embedding-004, streaming generation) |
-| Search | Custom **BM25** + pgvector distance + **RRF** |
-| Styling | **Tailwind CSS** (project configured); main app UI uses component-scoped styling |
-| Charts | **Recharts** |
-| Client resilience | **Error boundaries**, guarded `fetch` + JSON parsing |
+This makes it closer to systems like **Perplexity, Glean, or enterprise knowledge assistants**.
 
 ---
 
-## Architecture
+## ✨ Features
 
-### Ingest
+* 📄 Multi-format document upload (PDF, TXT, MD, CSV)
+* ✂️ Sentence-aware chunking with overlap
+* 🧠 Server-side embeddings (Gemini)
+* 🔍 Hybrid search (BM25 + vector similarity + RRF)
+* ⚡ Streaming AI responses (SSE)
+* 📚 Source attribution (document + chunk-level)
+* 🗂 Chunk inspector (browse + jump to source)
+* 📊 Analytics dashboard
+* 💾 Supabase persistence (Postgres + pgvector)
+* 🛡 Fallback mechanisms for embeddings and chat
+
+---
+
+## 🧱 Tech Stack
+
+| Layer    | Technology                                    |
+| -------- | --------------------------------------------- |
+| Frontend | Next.js 15 (App Router), React 19, TypeScript |
+| Backend  | Next.js API routes                            |
+| Database | Supabase (PostgreSQL + pgvector)              |
+| AI       | Google Gemini (embeddings + streaming chat)   |
+| Search   | BM25 + vector similarity + RRF                |
+| Styling  | Tailwind CSS                                  |
+| Charts   | Recharts                                      |
+
+---
+
+## 🧠 Architecture
+
+### Ingest Pipeline
 
 ```text
-┌────────┐   chunk (client)    ┌─────────────┐   embed + persist   ┌──────────┐
-│ Client │ ──────────────────► │ /api/ingest │ ───────────────────► │ Supabase │
-└────────┘                    └─────────────┘                     │ documents│
-                                                                  │ + chunks │
-                                                                  └──────────┘
+Client → chunk → /api/ingest → embed (Gemini, server-side) → Supabase (documents + chunks)
 ```
 
-1. User selects files → text extracted (PDF via pdf.js CDN).
-2. Text is split with the shared chunker (`lib/chunker`).
-3. Chunks are sent to **`/api/ingest`**, which **embeds internally using Gemini** (`lib/gemini`), with a deterministic fallback if embedding fails, then inserts rows into **`documents`** and **`chunks`** (768-dim vectors). A separate **`/api/embed`** route exists for standalone embedding calls.
-
-### Query (retrieval)
-
-```text
-┌────────┐   POST JSON          ┌──────────────┐   embed query    ┌─────────────┐
-│ Client │ ───────────────────► │ /api/retrieve│ ───────────────► │ Hybrid rank │
-└────────┘                      └──────────────┘                  │ BM25 + vec  │
-        ◄──────────────────────  RetrievalResult[]  ◄─────────────│ + RRF       │
-                                                                   └─────────────┘
-```
-
-1. Query string → query embedding from the server.
-2. **BM25** over chunk text + **vector** ordering from Supabase RPCs → **RRF** to merge ranks.
-3. Optional filter by `document_id` for scoped search.
-
-### Chat
-
-```text
-┌────────┐   POST /api/chat     ┌─────────────┐   stream          ┌─────┐
-│ Client │ ──────────────────► │ Gemini SSE  │ ─────────────────► │ UI  │
-└────────┘                     └─────────────┘                    └─────┘
-```
-
-1. Client builds a prompt from retrieved chunks + optional conversation tail.
-2. **`/api/chat`** streams tokens; metadata block parsed for confidence and follow-ups.
-3. UI updates incrementally; sources link back to the chunk inspector.
+* Documents are chunked on the client
+* `/api/ingest` generates embeddings server-side (`lib/gemini`; deterministic fallback if embedding fails)
+* Data is stored in Supabase with pgvector
 
 ---
 
-## Key Design Decisions
+### Retrieval Pipeline
 
-- **Server-side embeddings** — consistent retrieval vectors, API keys stay on the server, and clients never touch provider credentials
-- **Hybrid search (BM25 + vector)** — better recall than pure dense retrieval on keyword-heavy queries
-- **RRF fusion** — balances lexical and semantic rankings without brittle score calibration
-- **Streaming responses** — lower perceived latency; metadata appended after the visible answer
-- **Service-role Supabase access from API routes** — ingestion and RPCs run with a controlled server identity (complement with RLS if you expose the browser client)
+```text
+Client → /api/retrieve → embed query → BM25 + vector → RRF → results
+```
+
+* Query is embedded on the server
+* BM25 + vector similarity are combined
+* RRF merges rankings for better recall
 
 ---
 
-## Project Structure
+### Chat Pipeline
+
+```text
+Client → /api/chat → Gemini (streaming) → UI
+```
+
+* Context is built from retrieved chunks
+* Responses stream token-by-token
+* Metadata is appended after completion
+
+---
+
+## 🧩 Key Design Decisions
+
+* **Server-side embeddings**
+  Ensures consistency, security, and centralized control
+
+* **Hybrid search (BM25 + vector)**
+  Improves retrieval quality over pure vector search
+
+* **Reciprocal Rank Fusion (RRF)**
+  Balances lexical and semantic ranking
+
+* **Streaming responses**
+  Reduces perceived latency and improves UX
+
+* **Supabase service role (server-only)**
+  Secure ingestion and RPC-based retrieval
+
+---
+
+## 📁 Project Structure
 
 ```text
 src/
 ├── app/
 │   ├── api/
-│   │   ├── chat/          # Streaming LLM + JSON fallbacks
-│   │   ├── embed/         # Gemini embeddings (768-dim)
-│   │   ├── ingest/        # Chunk persistence + document row
-│   │   ├── retrieve/      # Hybrid search orchestration
-│   │   └── documents/     # List / delete + per-doc chunks
+│   │   ├── chat/
+│   │   ├── embed/
+│   │   ├── ingest/
+│   │   ├── retrieve/
+│   │   └── documents/
 │   ├── layout.tsx
-│   ├── page.tsx
-│   └── globals.css
+│   └── page.tsx
 ├── components/
-│   ├── RAGBase.tsx        # Main application shell + views
-│   └── RAGBaseErrorBoundary.tsx
+│   └── RAGBase.tsx
 └── lib/
-    ├── bm25.ts            # Lexical scoring
-    ├── chunker.ts         # Text splitting
-    ├── gemini.ts          # Embeddings + generate + stream helpers
-    ├── search.ts          # RRF + hybrid assembly
-    ├── supabase/          # Server + optional browser client
-    ├── embedFallback.ts
-    └── …                  # tokenizer, vector types, retrieval DTOs
-
-supabase/migrations/       # SQL for pgvector + RPCs
+    ├── gemini.ts
+    ├── search.ts
+    ├── chunker.ts
+    ├── bm25.ts
+    ├── supabase/
 ```
 
 ---
 
-## Setup Instructions
+## ⚙️ Setup
 
-1. **Clone and install**
-
-   ```bash
-   git clone <your-repo-url> ragbase
-   cd ragbase
-   npm install
-   ```
-
-2. **Create a Supabase project**  
-   Note the project URL and keys from **Project Settings → API**.
-
-3. **Run the database migration** (see [Supabase Setup](#supabase-setup)).
-
-4. **Configure environment variables** — copy `.env.example` to `.env.local` and fill values (see below).
-
-5. **Start the dev server**
-
-   ```bash
-   npm run dev
-   ```
-
-6. Open [http://localhost:3000](http://localhost:3000).
-
----
-
-## Environment Variables
-
-Create **`.env.local`** in the project root (never commit secrets):
+### 1. Clone
 
 ```bash
-# Server-only — used by /api/embed and /api/chat (do not prefix with NEXT_PUBLIC_)
-GEMINI_API_KEY=
-
-# Supabase — server / API routes only (service role for ingestion & RPC)
-SUPABASE_URL=
-SUPABASE_SERVICE_ROLE_KEY=
-
-# Optional — browser-safe keys if you add direct Supabase client usage with RLS
-NEXT_PUBLIC_SUPABASE_URL=
-NEXT_PUBLIC_SUPABASE_ANON_KEY=
+git clone https://github.com/prasannawarad/RAGbase.git
+cd RAGbase
 ```
 
-- **`GEMINI_API_KEY`** — required for embeddings and chat.
-- **`SUPABASE_*`** — required for listing, ingesting, and searching documents/chunks.
+---
+
+### 2. Install dependencies
+
+```bash
+npm install
+```
 
 ---
 
-## Supabase Setup
+### 3. Environment variables
 
-1. In the Supabase dashboard, open **SQL Editor**.
-2. Run the migration in **`supabase/migrations/001_ragbase_pgvector.sql`** (or use Supabase CLI: `supabase db push` if you link the project).
+Create `.env.local` (see also `.env.example`):
 
-This script:
+```env
+GEMINI_API_KEY=your_key_here
 
-- Enables the **`vector`** extension
-- Creates **`documents`** and **`chunks`** (768-dimensional embeddings)
-- Adds **`match_chunks`** and **`chunk_vector_distances`** RPCs for vector search
-- Grants rights used by the **service role** from API routes
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+```
 
-After migration, confirm tables appear under **Table Editor** and test a simple query in the SQL editor if needed.
-
----
-
-## Running Locally
-
-| Command | Description |
-|---------|-------------|
-| `npm run dev` | Next.js dev server (Turbopack optional: `npm run dev:turbo`) |
-| `npm run build` | Production build |
-| `npm run start` | Serve production build |
-| `npm run lint` | ESLint |
-
-For a clean dev cache: `npm run dev:clean`.
+Optional (browser client + RLS): `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
 
 ---
 
-## Deployment
+### 4. Supabase setup
 
-- **Recommended:** [Vercel](https://vercel.com) for Next.js (App Router + API routes on the same deployment)
-- **Database:** Supabase (hosted Postgres + pgvector)
-- **Secrets:** configure `GEMINI_API_KEY`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY` in the host’s environment (e.g. Vercel Project Settings → Environment Variables)
+In the Supabase **SQL Editor**, run the full migration:
 
-Production build locally:
+**[`supabase/migrations/001_ragbase_pgvector.sql`](./supabase/migrations/001_ragbase_pgvector.sql)**
+
+It enables **`vector`**, creates **`documents`** and **`chunks`** (768-dim embeddings), and adds RPCs (`match_chunks`, `chunk_vector_distances`) used by retrieval. Do not use a minimal stub schema — the app expects this shape.
+
+---
+
+### 5. Run locally
+
+```bash
+npm run dev
+```
+
+Open: [http://localhost:3000](http://localhost:3000)
+
+---
+
+## 🚀 Deployment
+
+* Recommended: **Vercel**
+* Database: **Supabase**
+* Add environment variables in deployment settings
 
 ```bash
 npm run build
@@ -235,31 +214,44 @@ npm start
 
 ---
 
-## Dev Notes
+## 🧪 Dev Notes
 
-- Next.js dev server may need a cache reset in rare cases: `rm -rf .next` (this repo includes `npm run dev:clean`)
-- Supabase must have the **pgvector** extension enabled (see migration)
-- Chat may fall back to non-streaming JSON if streaming/SSE cannot be established
-- Keep **service role** keys server-only; never expose them with `NEXT_PUBLIC_`
+* If dev server breaks:
 
----
+  ```bash
+  rm -rf .next
+  ```
 
-## Future Improvements
+  Or: `npm run dev:clean`
 
-- **IndexedDB** (or similar) for client-side embedding or chunk cache and faster re-opens
-- **IVFFLAT / HNSW** index tuning on `chunks.embedding` at scale (commented hints exist in migration)
-- **Auth** (e.g. Clerk / Supabase Auth) and per-tenant namespaces
-- **Evaluation suite** — retrieval hit rate, answer faithfulness
-- **Observability** — structured logs, tracing, and cost dashboards for Gemini usage
+* Supabase must have **pgvector enabled**
+* Streaming falls back to JSON if SSE fails
+* Keep service role keys server-only
 
 ---
 
-## Author
+## 🔮 Future Improvements
 
-Built by **Prasanna Warad** as a production-style RAG system.
+* Authentication (multi-user support)
+* Reranking with LLM
+* Background ingestion jobs
+* Vector indexing optimization (IVFFLAT / HNSW)
+* Observability & analytics
+
+---
+
+## 📄 Resume Summary
+
+* Built a production-grade RAG system with hybrid retrieval (BM25 + vector), server-side embedding pipelines, and real-time streaming LLM responses using Next.js and Supabase.
+
+---
+
+## 👤 Author
+
+**Prasanna Warad**
 
 ---
 
 <p align="center">
-  <sub>Next.js · Supabase · Gemini · Hybrid search</sub>
+  <sub>Next.js · Supabase · Gemini · Hybrid Search</sub>
 </p>
