@@ -12,7 +12,10 @@ import { isSupabaseConfigured } from "@/lib/supabase/server";
 export async function POST(req: Request) {
   if (!isSupabaseConfigured()) {
     return NextResponse.json(
-      { error: "Supabase is not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)" },
+      {
+        error:
+          "Supabase is not configured (set SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL)",
+      },
       { status: 503 }
     );
   }

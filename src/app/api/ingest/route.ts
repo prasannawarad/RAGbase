@@ -22,7 +22,10 @@ type IngestBody = {
 export async function POST(req: Request) {
   if (!isSupabaseConfigured()) {
     return NextResponse.json(
-      { error: "Supabase is not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)" },
+      {
+        error:
+          "Supabase is not configured (set SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL)",
+      },
       { status: 503 }
     );
   }
@@ -35,8 +38,7 @@ export async function POST(req: Request) {
   }
 
   const documentName = typeof body.documentName === "string" ? body.documentName.trim() : "";
-  const rawChunks = body.chunks;
-  if (!documentName || !Array.isArray(rawChunks) || rawChunks.length === 0) {
+  if (!documentName) {
     return NextResponse.json(
       {
         error:
@@ -46,8 +48,14 @@ export async function POST(req: Request) {
     );
   }
 
-  const chunkTexts = rawChunks.map((c) => String(c));
-  if (chunkTexts.some((t) => !t.trim())) {
+  const rawChunks = body.chunks;
+  if (!Array.isArray(rawChunks) || rawChunks.length === 0) {
+    return NextResponse.json({ error: "No chunks provided" }, { status: 400 });
+  }
+
+  const chunks = rawChunks.map((c) => String(c));
+
+  if (chunks.some((t) => !t.trim())) {
     return NextResponse.json({ error: "chunks must be non-empty strings" }, { status: 400 });
   }
 
@@ -61,55 +69,82 @@ export async function POST(req: Request) {
 
   let embeddings: number[][];
   try {
-    embeddings = await embedTexts(chunkTexts);
+    embeddings = await embedTexts(chunks);
   } catch {
-    embeddings = mockEmbeddingsForTexts(chunkTexts);
+    embeddings = mockEmbeddingsForTexts(chunks);
   }
 
-  if (embeddings.length !== chunkTexts.length) {
-    return NextResponse.json({ error: "Embedding count mismatch" }, { status: 500 });
-  }
-  for (const emb of embeddings) {
-    if (!emb || emb.length !== 768) {
-      return NextResponse.json({ error: "Invalid embedding dimensions" }, { status: 500 });
-    }
+  if (!embeddings || embeddings.length !== chunks.length) {
+    return NextResponse.json({ error: "Embedding mismatch" }, { status: 500 });
   }
 
-  const rawText = chunkTexts.join("\n\n");
+  if (embeddings[0]?.length !== 768) {
+    return NextResponse.json({ error: "Invalid embedding dimension" }, { status: 500 });
+  }
+
+  const rawText = chunks.join("\n\n");
   const charCount = rawText.length;
   const wordCount = rawText.split(/\s+/).filter(Boolean).length || 0;
-  const avgChunkSize = Math.round(
-    chunkTexts.reduce((s, t) => s + t.length, 0) / chunkTexts.length
-  );
+  const avgChunkSize =
+    chunks.length > 0
+      ? Math.round(chunks.reduce((acc, c) => acc + c.length, 0) / chunks.length)
+      : 0;
   const uploadedAt = new Date().toISOString();
 
   const supabase = getSupabaseAdmin();
 
-  const { data: docRow, error: docErr } = await supabase
+  const { data: insertedDocs, error } = await supabase
     .from("documents")
     .insert({
       name: documentName,
       raw_text: rawText,
       char_count: charCount,
       word_count: wordCount,
-      chunk_count: chunkTexts.length,
+      chunk_count: chunks.length,
       avg_chunk_size: avgChunkSize,
       pages,
       file_type: fileType,
       status: "indexed",
       uploaded_at: uploadedAt,
     })
-    .select("id")
-    .single();
+    .select("id");
 
-  if (docErr || !docRow) {
-    console.error("[api/ingest] document insert", docErr);
-    return NextResponse.json({ error: docErr?.message ?? "document insert failed" }, { status: 500 });
+  const docRow = insertedDocs?.[0];
+
+  if (error) {
+    console.error("[INGEST ERROR - DOCUMENT INSERT]:", {
+      message: error.message,
+      code: error.code,
+      details: error.details,
+      hint: error.hint,
+    });
+
+    return NextResponse.json(
+      {
+        error: "Failed to insert document",
+        details: error.message,
+        code: error.code,
+        hint: error.hint,
+        supabaseDetails: error.details,
+      },
+      { status: 500 }
+    );
+  }
+
+  if (!docRow) {
+    console.error("[INGEST ERROR - DOCUMENT INSERT]:", "No row returned");
+    return NextResponse.json(
+      {
+        error: "Failed to insert document",
+        details: "No row returned",
+      },
+      { status: 500 }
+    );
   }
 
   const docId = docRow.id as string;
 
-  const rows = chunkTexts.map((text, i) => {
+  const rows = chunks.map((text, i) => {
     const wordCountChunk = text.split(/\s+/).filter(Boolean).length || 0;
     return {
       document_id: docId,
@@ -124,12 +159,28 @@ export async function POST(req: Request) {
     };
   });
 
-  const { error: chunkErr } = await supabase.from("chunks").insert(rows);
+  const { error: chunkError } = await supabase.from("chunks").insert(rows);
 
-  if (chunkErr) {
-    console.error("[api/ingest] chunks insert", chunkErr);
+  if (chunkError) {
+    console.error("[INGEST ERROR - CHUNKS INSERT]:", {
+      message: chunkError.message,
+      code: chunkError.code,
+      details: chunkError.details,
+      hint: chunkError.hint,
+    });
+
     await supabase.from("documents").delete().eq("id", docId);
-    return NextResponse.json({ error: chunkErr.message }, { status: 500 });
+
+    return NextResponse.json(
+      {
+        error: "Failed to insert chunks",
+        details: chunkError.message,
+        code: chunkError.code,
+        hint: chunkError.hint,
+        supabaseDetails: chunkError.details,
+      },
+      { status: 500 }
+    );
   }
 
   return NextResponse.json({
@@ -137,7 +188,7 @@ export async function POST(req: Request) {
       id: docId,
       name: documentName,
       text: rawText,
-      chunks: chunkTexts.length,
+      chunks: chunks.length,
       charCount: charCount,
       wordCount: wordCount,
       avgChunkSize,

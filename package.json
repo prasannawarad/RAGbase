@@ -12,11 +12,16 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.103.0",
+    "groq-sdk": "^1.1.2",
     "next": "^15.5.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-is": "^19.0.0",
     "recharts": "^2.15.0",
     "server-only": "^0.0.1"
+  },
+  "overrides": {
+    "react-is": "^19.0.0"
   },
   "devDependencies": {
     "@types/node": "^22",

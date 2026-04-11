@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { generateText, openGeminiChatTextStream } from "@/lib/gemini";
+import { generateText as generateGroq, openGroqChatTextStream } from "@/lib/groq";
+import { generateText as generateGemini, openGeminiChatTextStream } from "@/lib/gemini";
 
 function parseSummaryFromModel(raw: string): {
   summary: string;
@@ -37,6 +38,24 @@ const FALLBACK_SUMMARY = {
   complexity: "intermediate",
 };
 
+function jsonTextFromCompletion(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return NextResponse.json({ mode: "text", text: FALLBACK_TEXT });
+  }
+  let out = trimmed;
+  if (!out.includes("<metadata>")) {
+    out += `\n\n<metadata>{"confidence":"medium","sources_used":[],"key_entities":[],"follow_up_questions":[]}</metadata>`;
+  }
+  return NextResponse.json({ mode: "text", text: out });
+}
+
+const streamHeaders = {
+  "Content-Type": "text/plain; charset=utf-8",
+  "Cache-Control": "no-store",
+  "X-Chat-Stream": "1",
+} as const;
+
 /**
  * Body: { prompt: string }
  * - RAG chat → streaming text/plain (UTF-8 deltas) with X-Chat-Stream: 1, or JSON fallback { mode: "text", text }
@@ -54,45 +73,49 @@ export async function POST(req: Request) {
       prompt.includes("Summarize this document") && prompt.includes("Respond ONLY in JSON");
 
     if (isSummary) {
+      let raw: string;
       try {
-        const raw = await generateText(prompt, { temperature: 0.4, maxOutputTokens: 3000 });
-        const parsed = parseSummaryFromModel(raw);
-        if (parsed) {
-          return NextResponse.json({
-            mode: "summary",
-            ...parsed,
-          });
-        }
-        return NextResponse.json(FALLBACK_SUMMARY);
+        raw = await generateGroq(prompt, { temperature: 0.4, maxOutputTokens: 3000 });
       } catch {
-        return NextResponse.json(FALLBACK_SUMMARY);
+        try {
+          raw = await generateGemini(prompt, { temperature: 0.4, maxOutputTokens: 3000 });
+        } catch {
+          return NextResponse.json(FALLBACK_SUMMARY);
+        }
       }
+      const parsed = parseSummaryFromModel(raw);
+      if (parsed) {
+        return NextResponse.json({
+          mode: "summary",
+          ...parsed,
+        });
+      }
+      return NextResponse.json(FALLBACK_SUMMARY);
     }
 
     try {
-      const stream = await openGeminiChatTextStream(prompt, { temperature: 0.3, maxOutputTokens: 3000 });
-      return new Response(stream, {
-        headers: {
-          "Content-Type": "text/plain; charset=utf-8",
-          "Cache-Control": "no-store",
-          "X-Chat-Stream": "1",
-        },
-      });
-    } catch (streamErr) {
-      console.warn("[api/chat] stream failed, falling back to generateContent:", streamErr);
+      const stream = await openGroqChatTextStream(prompt, { temperature: 0.3, maxOutputTokens: 3000 });
+      return new Response(stream, { headers: streamHeaders });
+    } catch (groqStreamErr) {
+      console.warn("[api/chat] Groq stream failed:", groqStreamErr);
       try {
-        const text = await generateText(prompt, { temperature: 0.3, maxOutputTokens: 3000 });
-        const trimmed = text.trim();
-        if (!trimmed) {
-          return NextResponse.json({ mode: "text", text: FALLBACK_TEXT });
+        const stream = await openGeminiChatTextStream(prompt, { temperature: 0.3, maxOutputTokens: 3000 });
+        return new Response(stream, { headers: streamHeaders });
+      } catch (geminiStreamErr) {
+        console.warn("[api/chat] Gemini stream failed:", geminiStreamErr);
+        try {
+          const text = await generateGroq(prompt, { temperature: 0.3, maxOutputTokens: 3000 });
+          return jsonTextFromCompletion(text);
+        } catch (groqTextErr) {
+          console.warn("[api/chat] Groq generateText failed:", groqTextErr);
+          try {
+            const text = await generateGemini(prompt, { temperature: 0.3, maxOutputTokens: 3000 });
+            return jsonTextFromCompletion(text);
+          } catch (geminiTextErr) {
+            console.warn("[api/chat] Gemini generateText failed:", geminiTextErr);
+            return NextResponse.json({ mode: "text", text: FALLBACK_TEXT });
+          }
         }
-        let out = trimmed;
-        if (!out.includes("<metadata>")) {
-          out += `\n\n<metadata>{"confidence":"medium","sources_used":[],"key_entities":[],"follow_up_questions":[]}</metadata>`;
-        }
-        return NextResponse.json({ mode: "text", text: out });
-      } catch {
-        return NextResponse.json({ mode: "text", text: FALLBACK_TEXT });
       }
     }
   } catch {

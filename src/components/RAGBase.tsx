@@ -4,8 +4,8 @@ import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import type { ChangeEvent, CSSProperties, DragEvent } from "react";
 
 // ══════════════════════════════════════════════════════════════
-// RAGBase v2 — Document Intelligence & RAG Platform
-// ── New in v2 ──────────────────────────────────────────────
+// RAGBase — Document Intelligence & RAG Platform
+// ─────────────────────────────────────────────────────────────
 //   ✦ PDF support via pdf.js (dynamic CDN load)
 //   ✦ Hybrid search: BM25 + Vector via Reciprocal Rank Fusion
 //   ✦ Supabase + pgvector persistence
@@ -325,14 +325,11 @@ const VIEWS = {
   CHUNKS: "chunks", ANALYTICS: "analytics", PIPELINE: "pipeline",
 };
 
-/** Blank-screen bisect: set each to `false` to re-enable (one at a time). */
-const DEBUG_DISABLE_RECHARTS = true;
-const DEBUG_DISABLE_PDF = true;
+const DEBUG_DISABLE_RECHARTS = false;
+const DEBUG_DISABLE_PDF = false;
 
 // ══════════════════════════════════════════════════════════════
 export default function RAGBase() {
-  console.log("[RAGBase] render start");
-
   // ─── Core State ─────────────────────────────────────────────
   const [view, setView] = useState<(typeof VIEWS)[keyof typeof VIEWS]>(VIEWS.UPLOAD);
   const [documents, setDocuments] = useState<StoredDocument[]>([]);
@@ -381,24 +378,31 @@ export default function RAGBase() {
   const [useHybridSearch, setUseHybridSearch] = useState(true);  // NEW: BM25 + Vector
 
   const [error, setError] = useState("");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const chatInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const docFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  console.log("[RAGBase] before effect", "mount-log");
   useEffect(() => {
     console.log("[RAGBase] mounted");
     return () => console.log("[RAGBase] unmounted");
   }, []);
 
-  console.log("[RAGBase] before effect", "chat-scroll");
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatMessages]);
 
-  console.log("[RAGBase] before effect", "chat-focus");
   useEffect(() => {
     if (!chatLoading && view === VIEWS.CHAT) chatInputRef.current?.focus();
   }, [chatLoading, view]);
+
+  useEffect(() => {
+    if (!sidebarOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [sidebarOpen]);
 
   // ─── Load documents from Supabase (mount + Retry) ────────────
   const refetchDocuments = useCallback(async () => {
@@ -449,12 +453,10 @@ export default function RAGBase() {
     }
   }, []);
 
-  console.log("[RAGBase] before effect", "supabase-load-documents");
   useEffect(() => {
     void refetchDocuments();
   }, [refetchDocuments]);
 
-  console.log("[RAGBase] before effect", "chunks-by-doc");
   useEffect(() => {
     if (view !== VIEWS.CHUNKS || !documents.length) {
       setChunksByDocId({});
@@ -564,9 +566,23 @@ export default function RAGBase() {
           console.error("[API /api/ingest] network:", e);
           throw new Error(e instanceof Error ? e.message : "Ingest network error");
         }
-        const { parsed: payload, parseError } = await readJsonOnce<{ error?: string; document?: StoredDocument }>(res);
+        const { parsed: payload, parseError } = await readJsonOnce<{
+          error?: string;
+          details?: string;
+          code?: string;
+          document?: StoredDocument;
+        }>(res);
         if (!res.ok) {
-          const msg = (!parseError && payload?.error) || `Ingest failed (${res.status})`;
+          const base = (!parseError && payload?.error) || `Ingest failed (${res.status})`;
+          const detail =
+            !parseError && typeof payload?.details === "string" && payload.details.trim()
+              ? payload.details.trim()
+              : "";
+          const code =
+            !parseError && typeof payload?.code === "string" && payload.code.trim()
+              ? payload.code.trim()
+              : "";
+          const msg = [base, detail && `(${detail})`, code && `[${code}]`].filter(Boolean).join(" ");
           console.error("[API /api/ingest]", res.status, msg);
           throw new Error(msg);
         }
@@ -1027,11 +1043,143 @@ ${doc.text.substring(0, 3000)}`
     </div>
   ) : null;
 
+  const renderSidebarContent = () => (
+    <>
+      <div style={S.sidebarTop}>
+        <div style={S.logoRow}>
+          <div style={S.logoGem}>R</div>
+          <div>
+            <div style={S.logoTitle}>RAGBase</div>
+            <div style={S.logoSub}>Document Intelligence</div>
+          </div>
+        </div>
+        <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 5 }}>
+          <div
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: "50%",
+              background: dbLoading ? "var(--warn)" : dbSynced ? "var(--accent)" : "var(--border2)",
+              flexShrink: 0,
+            }}
+          />
+          <span style={{ fontSize: 9, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace" }}>
+            {dbLoading ? "loading…" : dbSynced ? "Supabase synced" : "not persisted"}
+          </span>
+        </div>
+      </div>
+
+      <div style={S.sidebarNav} className="flex-1 min-h-0 overflow-y-auto transition-all duration-200">
+        {[
+          { id: VIEWS.UPLOAD, icon: "⬆", label: "Upload" },
+          { id: VIEWS.DOCUMENTS, icon: "📚", label: "Documents", count: documents.length },
+          { id: VIEWS.CHAT, icon: "💬", label: "Chat", disabled: !documents.length },
+          { id: VIEWS.CHUNKS, icon: "🔬", label: "Chunk Inspector", disabled: !documents.length },
+          { id: VIEWS.ANALYTICS, icon: "📊", label: "Analytics", disabled: !documents.length },
+          { id: VIEWS.PIPELINE, icon: "⚙️", label: "Pipeline" },
+        ].map((item) => (
+          <button
+            key={item.id}
+            className="hov"
+            onClick={() => {
+              if (item.disabled) return;
+              setView(item.id);
+              setSidebarOpen(false);
+            }}
+            style={{
+              ...S.navItem,
+              background: view === item.id ? "var(--surface3)" : "transparent",
+              borderLeft: view === item.id ? "2px solid var(--primary)" : "2px solid transparent",
+              opacity: item.disabled ? 0.35 : 1,
+              cursor: item.disabled ? "not-allowed" : "pointer",
+            }}
+          >
+            <span style={{ fontSize: 14 }}>{item.icon}</span>
+            <span style={{ flex: 1, fontSize: 12 }}>{item.label}</span>
+            {(item.count ?? 0) > 0 && <span style={S.badge}>{item.count}</span>}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-auto flex shrink-0 flex-col border-t border-zinc-800/80 transition-all duration-200">
+        <div className="grid grid-cols-3 gap-1 px-3.5 py-2.5 text-center text-xs md:text-sm">
+          {[
+            { label: "Docs", value: documents.length, color: "var(--primary)" },
+            { label: "Chunks", value: totalChunks, color: "var(--accent)" },
+            { label: "Queries", value: queryLog.length, color: "var(--accent2)" },
+          ].map((s) => (
+            <div key={s.label} style={S.statItem}>
+              <span className="break-words" style={{ fontSize: 10, color: "var(--text)" }}>
+                {s.label}
+              </span>
+              <span
+                style={{
+                  fontSize: 14,
+                  fontWeight: 800,
+                  color: s.color,
+                  fontFamily: "'IBM Plex Mono', monospace",
+                }}
+              >
+                {s.value}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        <div style={S.sidebarFoot}>
+          <div style={{ marginBottom: 8, padding: "6px 10px", background: "var(--surface2)", borderRadius: 5 }}>
+            <div
+              style={{
+                fontSize: 9,
+                color: "var(--text)",
+                marginBottom: 4,
+                fontFamily: "'IBM Plex Mono', monospace",
+                textTransform: "uppercase",
+              }}
+            >
+              Search Mode
+            </div>
+            <div style={{ display: "flex", gap: 4 }}>
+              {[
+                { label: "Hybrid", value: true, color: "var(--accent2)" },
+                { label: "Vector", value: false, color: "var(--primary)" },
+              ].map((opt) => (
+                <button
+                  key={opt.label}
+                  onClick={() => setUseHybridSearch(opt.value)}
+                  style={{
+                    flex: 1,
+                    padding: "3px 0",
+                    fontSize: 10,
+                    fontWeight: 700,
+                    border: "none",
+                    borderRadius: 4,
+                    cursor: "pointer",
+                    fontFamily: "'IBM Plex Mono', monospace",
+                    background: useHybridSearch === opt.value ? opt.color + "22" : "transparent",
+                    color: useHybridSearch === opt.value ? opt.color : "var(--text)",
+                    borderBottom:
+                      useHybridSearch === opt.value ? `1px solid ${opt.color}` : "1px solid transparent",
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+
   // ══════════════════════════════════════════════════════════
   // RENDER
   // ══════════════════════════════════════════════════════════
   return (
-    <div style={S.wrapper}>
+    <div
+      className="flex h-screen w-screen min-h-0 overflow-hidden bg-transparent font-sans text-[var(--text)] transition-all duration-200"
+      style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}
+    >
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
         :root {
@@ -1066,107 +1214,52 @@ ${doc.text.substring(0, 3000)}`
         .streaming-cursor { display: inline-block; width: 2px; height: 14px; background: var(--primary); margin-left: 2px; animation: blink 0.8s step-end infinite; vertical-align: text-bottom; }
       `}</style>
 
-      {/* ─── Sidebar ─── */}
-      <div style={S.sidebar}>
-        <div style={S.sidebarTop}>
-          <div style={S.logoRow}>
-            <div style={S.logoGem}>R</div>
-            <div>
-              <div style={S.logoTitle}>RAGBase</div>
-              <div style={S.logoSub}>Document Intelligence</div>
-            </div>
-          </div>
-          {/* Persistence indicator */}
-          <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 5 }}>
-            <div style={{
-              width: 6, height: 6, borderRadius: "50%",
-              background: dbLoading ? "var(--warn)" : dbSynced ? "var(--accent)" : "var(--border2)",
-              flexShrink: 0,
-            }} />
-            <span style={{ fontSize: 9, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace" }}>
-              {dbLoading ? "loading…" : dbSynced ? "Supabase synced" : "not persisted"}
-            </span>
-          </div>
-        </div>
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/50 md:hidden"
+          aria-hidden="true"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
 
-        <div style={S.sidebarNav}>
-          {[
-            { id: VIEWS.UPLOAD, icon: "⬆", label: "Upload" },
-            { id: VIEWS.DOCUMENTS, icon: "📚", label: "Documents", count: documents.length },
-            { id: VIEWS.CHAT, icon: "💬", label: "Chat", disabled: !documents.length },
-            { id: VIEWS.CHUNKS, icon: "🔬", label: "Chunk Inspector", disabled: !documents.length },
-            { id: VIEWS.ANALYTICS, icon: "📊", label: "Analytics", disabled: !documents.length },
-            { id: VIEWS.PIPELINE, icon: "⚙️", label: "Pipeline" },
-          ].map((item) => (
-            <button
-              key={item.id}
-              className="hov"
-              onClick={() => !item.disabled && setView(item.id)}
-              style={{
-                ...S.navItem,
-                background: view === item.id ? "var(--surface3)" : "transparent",
-                borderLeft: view === item.id ? "2px solid var(--primary)" : "2px solid transparent",
-                opacity: item.disabled ? 0.35 : 1,
-                cursor: item.disabled ? "not-allowed" : "pointer",
-              }}
-            >
-              <span style={{ fontSize: 14 }}>{item.icon}</span>
-              <span style={{ flex: 1, fontSize: 12 }}>{item.label}</span>
-              {(item.count ?? 0) > 0 && <span style={S.badge}>{item.count}</span>}
-            </button>
-          ))}
-        </div>
-
-        <div style={S.sidebarStats}>
-          {[
-            { label: "Docs", value: documents.length, color: "var(--primary)" },
-            { label: "Chunks", value: totalChunks, color: "var(--accent)" },
-            { label: "Queries", value: queryLog.length, color: "var(--accent2)" },
-          ].map((s) => (
-            <div key={s.label} style={S.statItem}>
-              <span style={{ fontSize: 10, color: "var(--text)" }}>{s.label}</span>
-              <span style={{
-                fontSize: 14, fontWeight: 800, color: s.color,
-                fontFamily: "'IBM Plex Mono', monospace",
-              }}>{s.value}</span>
-            </div>
-          ))}
-        </div>
-
-        <div style={S.sidebarFoot}>
-          {/* Search mode toggle */}
-          <div style={{ marginBottom: 8, padding: "6px 10px", background: "var(--surface2)", borderRadius: 5 }}>
-            <div style={{ fontSize: 9, color: "var(--text)", marginBottom: 4, fontFamily: "'IBM Plex Mono', monospace", textTransform: "uppercase" }}>
-              Search Mode
-            </div>
-            <div style={{ display: "flex", gap: 4 }}>
-              {[
-                { label: "Hybrid", value: true, color: "var(--accent2)" },
-                { label: "Vector", value: false, color: "var(--primary)" },
-              ].map((opt) => (
-                <button
-                  key={opt.label}
-                  onClick={() => setUseHybridSearch(opt.value)}
-                  style={{
-                    flex: 1, padding: "3px 0", fontSize: 10, fontWeight: 700,
-                    border: "none", borderRadius: 4, cursor: "pointer", fontFamily: "'IBM Plex Mono', monospace",
-                    background: useHybridSearch === opt.value ? opt.color + "22" : "transparent",
-                    color: useHybridSearch === opt.value ? opt.color : "var(--text)",
-                    borderBottom: useHybridSearch === opt.value ? `1px solid ${opt.color}` : "1px solid transparent",
-                  }}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
+      <div
+        className={`
+          fixed inset-y-0 left-0 z-50 flex h-full w-64 shrink-0 flex-col overflow-hidden
+          border-r border-white/10 bg-[#06060f]
+          transition-transform duration-300 ease-out
+          ${sidebarOpen ? "translate-x-0" : "-translate-x-full"}
+          md:static md:inset-auto md:z-auto md:translate-x-0
+        `}
+      >
+        {renderSidebarContent()}
       </div>
 
       {/* ─── Main ─── */}
-      <div style={S.main}>
+      <div className="flex h-full min-h-0 flex-1 flex-col">
+        <div className="flex shrink-0 items-center justify-between border-b border-white/10 p-4 md:hidden">
+          <span className="font-semibold text-[var(--text-bright)]">RAGBase</span>
+          <button
+            type="button"
+            className="p-2 text-lg text-[var(--text-bright)] transition-all duration-200"
+            onClick={() => setSidebarOpen((prev) => !prev)}
+            aria-label={sidebarOpen ? "Close menu" : "Open menu"}
+          >
+            ☰
+          </button>
+        </div>
+        <div className="border-b border-white/5" />
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
+            <div
+              className="
+                flex min-h-full flex-col rounded-none border border-white/5 bg-black/60
+                shadow-[0_0_0_1px_rgba(255,255,255,0.03),0_10px_30px_rgba(0,0,0,0.5)]
+                backdrop-blur-md md:rounded-xl
+              "
+            >
+              <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col space-y-6 break-words px-4 pt-6 pb-6 sm:px-6 lg:px-8">
         {error && (
-          <div style={S.errorBar}>
+          <div className="break-words" style={S.errorBar}>
             <span>⚠️</span>
             <span style={{ flex: 1 }}>{error}</span>
             <button onClick={() => setError("")} style={{ background: "none", border: "none", color: "var(--danger)", cursor: "pointer" }}>✕</button>
@@ -1209,10 +1302,12 @@ ${doc.text.substring(0, 3000)}`
 
         {/* ═══════ UPLOAD ═══════ */}
         {view === VIEWS.UPLOAD && !processing && (
-          <div style={{ animation: "fadeUp 0.5s ease", maxWidth: 660, margin: "36px auto" }}>
-            <div style={{ textAlign: "center", marginBottom: 32 }}>
-              <h1 style={S.hero}><span style={{ color: "var(--primary)" }}>RAG</span> Pipeline <span style={{ fontSize: 16, color: "var(--accent2)" }}>v2</span></h1>
-              <p style={S.heroSub}>
+          <div className="w-full" style={{ animation: "fadeUp 0.5s ease" }}>
+            <div className="mt-4 mb-6 space-y-4 text-center">
+              <h1 className="text-4xl font-semibold tracking-tight text-[var(--text-bright)] sm:text-5xl">
+                <span style={{ color: "var(--primary)" }}>RAG</span> Pipeline
+              </h1>
+              <p className="mx-auto max-w-2xl text-sm text-white/60 sm:text-base">
                 Full RAG — PDF · TXT · MD · CSV · Hybrid BM25+Vector Search · Supabase pgvector · Streaming Generation
               </p>
             </div>
@@ -1243,15 +1338,26 @@ ${doc.text.substring(0, 3000)}`
             />
 
             <div
-              className="drop-t"
+              className="
+                mx-auto w-full max-w-2xl cursor-pointer
+                border border-dashed border-purple-500/30
+                hover:border-purple-400/60
+                transition
+                rounded-xl
+                p-8
+                bg-white/[0.02]
+                text-center
+              "
               onDragOver={(e) => e.preventDefault()}
               onDrop={handleDrop}
               onClick={() => fileInputRef.current?.click()}
-              style={S.dropZone}
+              style={{ marginBottom: 12 }}
             >
               <div style={{ fontSize: 36, color: "var(--primary)", marginBottom: 10, opacity: 0.5 }}>◈</div>
-              <h3 style={{ fontSize: 16, fontWeight: 700, color: "var(--text-bright)", marginBottom: 4 }}>Drop documents here</h3>
-              <p style={{ fontSize: 13, color: "var(--text)" }}>.pdf · .txt · .md · .csv · Multiple files supported</p>
+              <h3 className="text-base font-bold text-[var(--text-bright)] md:text-lg" style={{ marginBottom: 4 }}>
+                Drop documents here
+              </h3>
+              <p className="text-sm text-[var(--text)] md:text-base">.pdf · .txt · .md · .csv · Multiple files supported</p>
               <div style={{ marginTop: 12, display: "flex", justifyContent: "center", gap: 6 }}>
                 {["📕 PDF", "📄 TXT", "📝 MD", "📊 CSV"].map((t) => (
                   <span key={t} style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "var(--surface2)", color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace" }}>{t}</span>
@@ -1265,8 +1371,16 @@ ${doc.text.substring(0, 3000)}`
 
             {/* Architecture overview */}
             <div style={{ ...S.card, marginTop: 24 }}>
-              <h3 style={S.cardTitle}>Architecture v2</h3>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+              <h3 style={S.cardTitle}>Architecture</h3>
+              <div
+                className="
+                  grid
+                  gap-5
+                  grid-cols-1
+                  sm:grid-cols-2
+                  lg:grid-cols-3
+                "
+              >
                 {[
                   { icon: "📕", title: "PDF + Text", desc: "pdf.js extraction, TXT/MD/CSV. Multi-file batch." },
                   { icon: "✂️", title: "Chunk", desc: `Sentence-aware splitting (~${chunkSize} chars, ${chunkOverlap} overlap)` },
@@ -1275,11 +1389,22 @@ ${doc.text.substring(0, 3000)}`
                   { icon: "⚡", title: "Hybrid Search", desc: "BM25 + Cosine via Reciprocal Rank Fusion" },
                   { icon: "🌊", title: "Stream Generate", desc: "Live streaming answers with [Source N] citations" },
                 ].map((s, i) => (
-                  <div key={i} style={{ display: "flex", gap: 8, padding: "10px", background: "var(--surface2)", borderRadius: 6 }}>
+                  <div
+                    key={i}
+                    className="
+                      min-w-0 flex gap-2
+                      p-4
+                      rounded-xl
+                      bg-white/[0.03]
+                      border border-white/5
+                      hover:bg-white/[0.06]
+                      transition
+                    "
+                  >
                     <span style={{ fontSize: 18 }}>{s.icon}</span>
-                    <div>
+                    <div className="min-w-0">
                       <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-bright)", marginBottom: 2 }}>{s.title}</div>
-                      <div style={{ fontSize: 10, color: "var(--text)", lineHeight: 1.4 }}>{s.desc}</div>
+                      <div className="break-words" style={{ fontSize: 10, color: "var(--text)", lineHeight: 1.4 }}>{s.desc}</div>
                     </div>
                   </div>
                 ))}
@@ -1293,8 +1418,8 @@ ${doc.text.substring(0, 3000)}`
           <div style={{ animation: "fadeUp 0.4s ease" }}>
             <div style={S.viewHead}>
               <div>
-                <h2 style={S.viewTitle}>Knowledge Base</h2>
-                <p style={S.viewDesc}>
+                <h2 className="text-xl font-extrabold text-[var(--text-bright)] md:text-2xl" style={{ fontFamily: "'IBM Plex Mono', monospace", marginBottom: 3 }}>Knowledge Base</h2>
+                <p className="text-sm text-[var(--text)] md:text-base">
                   {documents.length} documents · {totalChunks} vectors ·{" "}
                   <span style={{ color: dbSynced ? "var(--accent)" : "var(--text)" }}>
                     {dbSynced ? "✓ persisted" : "not saved"}
@@ -1392,17 +1517,22 @@ ${doc.text.substring(0, 3000)}`
 
         {/* ═══════ CHAT ═══════ */}
         {view === VIEWS.CHAT && (
-          <div style={{ animation: "fadeUp 0.4s ease", display: "flex", flexDirection: "column", height: "calc(100vh - 40px)" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14, paddingBottom: 12, borderBottom: "1px solid var(--border)" }}>
-              <div>
-                <h2 style={S.viewTitle}>Knowledge Q&A</h2>
-                <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 2 }}>
-                  <p style={S.viewDesc}>{documents.length} docs · {totalChunks} chunks</p>
+          <div
+            className="flex min-h-0 flex-1 flex-col"
+            style={{ animation: "fadeUp 0.4s ease" }}
+          >
+            <div className="mb-3.5 flex flex-col gap-3 border-b border-[var(--border)] pb-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <h2 className="text-xl font-extrabold text-[var(--text-bright)] md:text-2xl" style={{ fontFamily: "'IBM Plex Mono', monospace", marginBottom: 3 }}>
+                  Knowledge Q&A
+                </h2>
+                <div className="flex flex-wrap items-center gap-2" style={{ marginTop: 2 }}>
+                  <p className="text-sm text-[var(--text)] md:text-base">{documents.length} docs · {totalChunks} chunks</p>
                   <SearchModeBadge mode={useHybridSearch ? "hybrid" : "vector"} />
                   <span style={{ fontSize: 10, color: "var(--accent)", fontFamily: "'IBM Plex Mono', monospace" }}>⟳ Streaming</span>
                 </div>
               </div>
-              <div style={{ display: "flex", gap: 6 }}>
+              <div className="flex shrink-0 flex-wrap gap-2">
                 <button
                   onClick={() => setShowRetrieval(!showRetrieval)}
                   className="hov"
@@ -1414,10 +1544,10 @@ ${doc.text.substring(0, 3000)}`
               </div>
             </div>
 
-            <div style={{ flex: 1, display: "flex", gap: 14, minHeight: 0 }}>
+            <div className="flex min-h-0 flex-1 flex-col gap-4 lg:flex-row lg:gap-3.5">
               {/* Chat Column */}
-              <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-                <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12, paddingBottom: 10 }}>
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+                <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pb-2.5">
                   {chatMessages.length === 0 && (
                     <div style={{ textAlign: "center", padding: "40px 20px", opacity: 0.5 }}>
                       <div style={{ fontSize: 36, marginBottom: 8 }}>◈</div>
@@ -1563,7 +1693,7 @@ ${doc.text.substring(0, 3000)}`
 
               {/* Retrieval Panel */}
               {showRetrieval && lastRetrieved.length > 0 && (
-                <div style={{ width: 290, flexShrink: 0, background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "14px", overflowY: "auto", maxHeight: "calc(100vh - 140px)" }}>
+                <div className="max-h-[min(50vh,calc(100vh-140px))] w-full shrink-0 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3.5 lg:max-h-none lg:w-[290px] lg:self-stretch">
                   <h4 style={{ fontSize: 11, fontWeight: 700, color: "var(--primary)", textTransform: "uppercase", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 4 }}>
                     Retrieved Chunks ({lastRetrieved.length})
                   </h4>
@@ -1603,14 +1733,14 @@ ${doc.text.substring(0, 3000)}`
           <div style={{ animation: "fadeUp 0.4s ease" }}>
             <div style={S.viewHead}>
               <div>
-                <h2 style={S.viewTitle}>Chunk Inspector</h2>
-                <p style={S.viewDesc}>Explore and semantically search the vector store · <SearchModeBadge mode={useHybridSearch ? "hybrid" : "vector"} /></p>
+                <h2 className="text-xl font-extrabold text-[var(--text-bright)] md:text-2xl" style={{ fontFamily: "'IBM Plex Mono', monospace", marginBottom: 3 }}>Chunk Inspector</h2>
+                <p className="text-sm text-[var(--text)] md:text-base">Explore and semantically search the vector store · <SearchModeBadge mode={useHybridSearch ? "hybrid" : "vector"} /></p>
               </div>
             </div>
 
             <div style={{ ...S.card, marginBottom: 16 }}>
               <h3 style={S.cardTitle}>🔍 {useHybridSearch ? "Hybrid" : "Semantic"} Search</h3>
-              <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+              <div className="mb-2.5 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
                 <select
                   value={selectedDocForChunks || ""}
                   onChange={(e) => setSelectedDocForChunks(e.target.value || null)}
@@ -1699,7 +1829,8 @@ ${doc.text.substring(0, 3000)}`
                     key={doc.id}
                     open={chunksDocExpanded[doc.id] ?? false}
                     onToggle={(e) => {
-                      setChunksDocExpanded((p) => ({ ...p, [doc.id]: e.currentTarget.open }));
+                      const isOpen = e.currentTarget.open;
+                      setChunksDocExpanded((p) => ({ ...p, [doc.id]: isOpen }));
                     }}
                     style={{ marginBottom: 8 }}
                   >
@@ -1731,13 +1862,13 @@ ${doc.text.substring(0, 3000)}`
           <div style={{ animation: "fadeUp 0.4s ease" }}>
             <div style={S.viewHead}>
               <div>
-                <h2 style={S.viewTitle}>Analytics</h2>
-                <p style={S.viewDesc}>{queryLog.length} queries logged · {documents.length} documents</p>
+                <h2 className="text-xl font-extrabold text-[var(--text-bright)] md:text-2xl" style={{ fontFamily: "'IBM Plex Mono', monospace", marginBottom: 3 }}>Analytics</h2>
+                <p className="text-sm text-[var(--text)] md:text-base">{queryLog.length} queries logged · {documents.length} documents</p>
               </div>
             </div>
 
             {/* KPI Row */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 14 }}>
+            <div className="mb-3.5 grid grid-cols-2 gap-2.5 sm:grid-cols-4">
               {[
                 { label: "Documents", value: documents.length, color: "var(--primary)" },
                 { label: "Total Chunks", value: totalChunks, color: "var(--accent)" },
@@ -1755,7 +1886,7 @@ ${doc.text.substring(0, 3000)}`
               ))}
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
               {/* Chunks per document */}
               <div style={S.card}>
                 <h3 style={S.cardTitle}>Chunks per Document</h3>
@@ -1784,28 +1915,33 @@ ${doc.text.substring(0, 3000)}`
                       Charts disabled (DEBUG_DISABLE_RECHARTS)
                     </div>
                   ) : (
-                    <ResponsiveContainer width="100%" height={160}>
-                      <PieChart>
-                        <Pie
-                          data={[
-                            { name: "High", value: queryStats.confCounts.high },
-                            { name: "Medium", value: queryStats.confCounts.medium },
-                            { name: "Low", value: queryStats.confCounts.low },
-                          ]}
-                          cx="50%" cy="50%" outerRadius={60}
-                          dataKey="value"
-                          label={({ name, percent }: { name?: string; percent?: number }) =>
-                            `${name ?? ""} ${percent != null ? (percent * 100).toFixed(0) : "0"}%`
-                          }
-                          labelLine={false}
-                        >
-                          {["#06D6A0", "#FFD166", "#EF476F"].map((c, i) => (
-                            <Cell key={i} fill={c} />
-                          ))}
-                        </Pie>
-                        <Tooltip contentStyle={{ background: "#0F1118", border: "1px solid #252940", borderRadius: 6, fontSize: 11 }} />
-                      </PieChart>
-                    </ResponsiveContainer>
+                    (() => {
+                      const confPieData = [
+                        { name: "High", value: queryStats.confCounts.high, fill: "#06D6A0" },
+                        { name: "Medium", value: queryStats.confCounts.medium, fill: "#FFD166" },
+                        { name: "Low", value: queryStats.confCounts.low, fill: "#EF476F" },
+                      ].filter((d) => d.value > 0);
+                      return (
+                        <ResponsiveContainer width="100%" height={160}>
+                          <PieChart>
+                            <Pie
+                              data={confPieData}
+                              cx="50%" cy="50%" outerRadius={72}
+                              dataKey="value"
+                              label={({ name, percent }: { name?: string; percent?: number }) =>
+                                `${name ?? ""} ${percent != null ? (percent * 100).toFixed(0) : "0"}%`
+                              }
+                              labelLine={false}
+                            >
+                              {confPieData.map((d) => (
+                                <Cell key={d.name} fill={d.fill} />
+                              ))}
+                            </Pie>
+                            <Tooltip contentStyle={{ background: "#0F1118", border: "1px solid #252940", borderRadius: 6, fontSize: 11 }} />
+                          </PieChart>
+                        </ResponsiveContainer>
+                      );
+                    })()
                   )
                 ) : (
                   <div style={{ height: 160, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -1878,14 +2014,14 @@ ${doc.text.substring(0, 3000)}`
           <div style={{ animation: "fadeUp 0.4s ease" }}>
             <div style={S.viewHead}>
               <div>
-                <h2 style={S.viewTitle}>Pipeline Config</h2>
-                <p style={S.viewDesc}>Tune chunking, retrieval, and search strategy</p>
+                <h2 className="text-xl font-extrabold text-[var(--text-bright)] md:text-2xl" style={{ fontFamily: "'IBM Plex Mono', monospace", marginBottom: 3 }}>Pipeline Config</h2>
+                <p className="text-sm text-[var(--text)] md:text-base">Tune chunking, retrieval, and search strategy</p>
               </div>
             </div>
 
             {documentsLoadErrorCard}
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
               <div style={S.card}>
                 <h3 style={S.cardTitle}>✂️ Chunking</h3>
                 <div style={{ marginBottom: 14 }}>
@@ -1927,7 +2063,7 @@ ${doc.text.substring(0, 3000)}`
               {/* NEW: Search Strategy card */}
               <div style={{ ...S.card, gridColumn: "1 / -1", borderColor: "var(--accent2)" + "33" }}>
                 <h3 style={{ ...S.cardTitle, color: "var(--accent2)" }}>⚡ Search Strategy</h3>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
                   {[
                     {
                       label: "Hybrid (BM25 + Vector)",
@@ -2025,7 +2161,7 @@ ${doc.text.substring(0, 3000)}`
               </div>
 
               <div style={{ ...S.card, gridColumn: "1 / -1", borderColor: "var(--primary)" + "33" }}>
-                <h3 style={S.cardTitle}>📐 Pipeline Flow v2</h3>
+                <h3 style={S.cardTitle}>📐 Pipeline Flow</h3>
                 <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "var(--text)", lineHeight: 2.4, padding: "8px 0" }}>
                   <span style={{ color: "var(--accent2)" }}>PDF/TXT/MD/CSV</span>{" → "}
                   <span style={{ color: "var(--primary)" }}>Sentence Chunker</span>{" → "}
@@ -2042,8 +2178,19 @@ ${doc.text.substring(0, 3000)}`
           </div>
         )}
 
-        <div style={S.footer}>
-          <p>Built by <strong>Prasanna Warad</strong> · RAGBase v2 · Backend /api/embed + /api/chat + /api/retrieve · Hybrid BM25+Vector · Supabase pgvector</p>
+            </div>
+          <footer
+            className="
+              border-t border-white/10
+              bg-black/30
+              px-6 py-3
+              text-center text-xs text-white/50
+            "
+          >
+            Built by Prasanna Warad · RAGBase · Backend /api/embed + /api/chat + /api/retrieve · Hybrid BM25+Vector · Supabase pgvector
+          </footer>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -2052,37 +2199,27 @@ ${doc.text.substring(0, 3000)}`
 
 // ══════════════════════════════════════════════════════════════
 const S: Record<string, CSSProperties> = {
-  wrapper: { minHeight: "100vh", background: "var(--bg)", fontFamily: "'Plus Jakarta Sans', sans-serif", color: "var(--text)", display: "flex" },
-  sidebar: { width: 216, flexShrink: 0, background: "var(--surface)", borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", position: "sticky", top: 0, height: "100vh" },
   sidebarTop: { padding: "16px 14px", borderBottom: "1px solid var(--border)" },
   logoRow: { display: "flex", alignItems: "center", gap: 8 },
   logoGem: { width: 30, height: 30, borderRadius: 7, background: "linear-gradient(135deg, var(--primary), var(--primary2))", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontWeight: 800, fontSize: 14, fontFamily: "'IBM Plex Mono', monospace" },
   logoTitle: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 14, fontWeight: 800, color: "var(--text-bright)" },
   logoSub: { fontSize: 9, color: "var(--text)" },
-  sidebarNav: { padding: "10px 6px", flex: 1, overflowY: "auto" },
+  sidebarNav: { padding: "10px 6px" },
   navItem: { width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 5, background: "transparent", border: "none", fontFamily: "'Plus Jakarta Sans', sans-serif", fontWeight: 600, color: "var(--text-bright)", cursor: "pointer", marginBottom: 1, textAlign: "left" },
   badge: { fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 8, background: "var(--primary)" + "22", color: "var(--primary)", fontFamily: "'IBM Plex Mono', monospace" },
-  sidebarStats: { padding: "10px 14px", borderTop: "1px solid var(--border)", display: "flex", justifyContent: "space-between" },
   statItem: { display: "flex", flexDirection: "column", alignItems: "center", gap: 2 },
   sidebarFoot: { padding: "10px 6px", borderTop: "1px solid var(--border)" },
-  main: { flex: 1, padding: "18px 24px", minWidth: 0, overflowY: "auto" },
   input: { width: "100%", padding: "8px 12px", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 5, color: "var(--text-bright)", fontSize: 12, fontFamily: "'Plus Jakarta Sans', sans-serif" },
   selectInput: { padding: "8px 10px", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 5, color: "var(--text-bright)", fontSize: 12, fontFamily: "'IBM Plex Mono', monospace", minWidth: 140 },
   btnPri: { padding: "8px 18px", background: "linear-gradient(135deg, var(--primary), var(--primary2))", border: "none", borderRadius: 5, color: "white", fontSize: 12, fontWeight: 700, fontFamily: "'Plus Jakarta Sans', sans-serif", cursor: "pointer", whiteSpace: "nowrap" },
   btnOut: { padding: "8px 16px", background: "transparent", border: "1px solid var(--border)", borderRadius: 5, color: "var(--text-bright)", fontSize: 12, fontWeight: 600, fontFamily: "'Plus Jakarta Sans', sans-serif", cursor: "pointer" },
   btnDanger: { padding: "8px 14px", background: "var(--danger)" + "18", border: "1px solid var(--danger)" + "33", borderRadius: 5, color: "var(--danger)", fontSize: 11, fontWeight: 700, fontFamily: "'Plus Jakarta Sans', sans-serif", cursor: "pointer" },
   errorBar: { display: "flex", alignItems: "center", gap: 8, background: "var(--danger)" + "10", border: "1px solid var(--danger)" + "33", borderRadius: 6, padding: "8px 14px", marginBottom: 12, fontSize: 12, color: "var(--danger)" },
-  hero: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 30, fontWeight: 800, color: "var(--text-bright)", lineHeight: 1.2, marginBottom: 10 },
-  heroSub: { fontSize: 12, color: "var(--text)", maxWidth: 520, margin: "0 auto", lineHeight: 1.7 },
-  dropZone: { border: "2px dashed var(--border2)", borderRadius: 10, padding: "40px 20px", textAlign: "center", cursor: "pointer", marginBottom: 12 },
   card: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "16px 18px", marginBottom: 10 },
   cardTitle: { fontSize: 11, fontWeight: 700, color: "var(--primary)", textTransform: "uppercase", letterSpacing: "0.05em", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 12 },
   viewHead: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16, flexWrap: "wrap", gap: 10 },
-  viewTitle: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 18, fontWeight: 800, color: "var(--text-bright)", marginBottom: 3 },
-  viewDesc: { fontSize: 12, color: "var(--text)" },
   progressTrack: { height: 4, background: "var(--surface3)", borderRadius: 2, overflow: "hidden", width: "100%" },
   progressFill: { height: "100%", borderRadius: 2, background: "linear-gradient(90deg, var(--primary), var(--accent))", transition: "width 0.5s ease", animation: "progressPulse 1.5s ease infinite" },
   cfgLabel: { display: "block", fontSize: 10, fontWeight: 700, color: "var(--text)", textTransform: "uppercase", letterSpacing: "0.05em", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 4 },
   cfgVal: { textAlign: "right", fontSize: 13, fontWeight: 800, color: "var(--primary)", fontFamily: "'IBM Plex Mono', monospace", marginTop: 2 },
-  footer: { textAlign: "center", marginTop: 28, padding: "12px", fontSize: 10, color: "#2D3346", borderTop: "1px solid var(--border)", fontFamily: "'IBM Plex Mono', monospace" },
 };

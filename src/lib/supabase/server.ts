@@ -1,6 +1,7 @@
 import "server-only";
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { getSupabaseProjectUrl, isSupabaseServerConfigured } from "@/lib/supabase/env";
 
 /**
  * SERVER / API ROUTES ONLY — Supabase admin client using the service role key.
@@ -30,10 +31,12 @@ function assertNotBrowser(): void {
 export function getSupabaseAdmin(): SupabaseClient {
   assertNotBrowser();
   if (_admin) return _admin;
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const url = getSupabaseProjectUrl();
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
   if (!url || !key) {
-    throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+    throw new Error(
+      "Missing SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) or SUPABASE_SERVICE_ROLE_KEY"
+    );
   }
   _admin = createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },
@@ -43,5 +46,5 @@ export function getSupabaseAdmin(): SupabaseClient {
 
 export function isSupabaseConfigured(): boolean {
   assertNotBrowser();
-  return Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+  return isSupabaseServerConfigured();
 }

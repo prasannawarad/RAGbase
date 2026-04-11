@@ -21,9 +21,8 @@ function mapRow(row: Record<string, unknown>) {
 export async function GET() {
   try {
     if (!isSupabaseConfigured()) {
-      return NextResponse.json(
-        { error: "Supabase is not configured", documents: [], totalChunks: 0 },
-        { status: 503 }
+      throw new Error(
+        "Supabase env not configured (SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL)"
       );
     }
 
@@ -62,7 +61,9 @@ export async function GET() {
 export async function DELETE() {
   try {
     if (!isSupabaseConfigured()) {
-      return NextResponse.json({ error: "Supabase is not configured" }, { status: 503 });
+      throw new Error(
+        "Supabase env not configured (SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL)"
+      );
     }
 
     const supabase = getSupabaseAdmin();
