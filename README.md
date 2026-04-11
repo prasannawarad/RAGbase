@@ -238,12 +238,6 @@ npm start
 
 ---
 
-## 📄 Resume Summary
-
-* Built a production-grade RAG system with hybrid retrieval (BM25 + vector), server-side embedding pipelines, and real-time streaming LLM responses using Next.js and Supabase.
-
----
-
 ## 👤 Author
 
 **Prasanna Warad**
