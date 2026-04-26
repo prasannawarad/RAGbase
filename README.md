@@ -47,7 +47,8 @@ This makes it closer to systems like **Perplexity, Glean, or enterprise knowledg
 * 🧠 Server-side embeddings (Gemini `text-embedding-004`, 768-dim)
 * 🔍 Hybrid search (BM25 + vector similarity + RRF)
 * ⚡ Streaming AI responses via Groq (SSE) with Gemini fallback
-* 📚 Source attribution (document + chunk-level)
+* 📚 Source attribution (document + chunk-level) with **clickable** `[Source N]` citations
+* 🧾 Sources drawer (right panel) + **Esc to close** + keyboard focus trap
 * 🗂 Chunk inspector (browse + semantic search)
 * 📊 Analytics dashboard (chunks per document, confidence distribution)
 * 💾 Supabase persistence (Postgres + pgvector)
@@ -68,6 +69,7 @@ This makes it closer to systems like **Perplexity, Glean, or enterprise knowledg
 | Search | BM25 + vector similarity + RRF |
 | Styling | Tailwind CSS |
 | Charts | Recharts |
+| Typography | `next/font` (Outfit + JetBrains Mono) |
 
 ---
 
@@ -233,9 +235,23 @@ npm start
   npm run dev:clean
   ```
 
+* If you ever see runtime errors like:
+  - `Cannot find module './611.js'` (or similar) from `.next/server/webpack-runtime.js`
+  
+  it means your local `.next` output is out of sync. Fix with:
+  
+  ```bash
+  rm -rf .next
+  npm run dev
+  ```
+
 * Supabase must have the **pgvector** extension enabled (migration 001 handles this)
 * Chat streaming falls back to JSON if streaming fails
 * Never put `SUPABASE_SERVICE_ROLE_KEY` in `NEXT_PUBLIC_*` variables
+
+### Vercel deploy troubleshooting
+
+If the hosted app ever shows chunk-missing errors after a large change, redeploy with a clean build cache (“Clear cache and redeploy” in Vercel UI).
 
 ---
 
