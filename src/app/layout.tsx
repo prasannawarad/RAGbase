@@ -17,6 +17,9 @@ const fontMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "RAGBase",
   description: "Document Intelligence & RAG Platform",
+  icons: {
+    icon: "/favicon.svg",
+  },
 };
 
 export default function RootLayout({
