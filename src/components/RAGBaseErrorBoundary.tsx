@@ -28,23 +28,27 @@ export class RAGBaseErrorBoundary extends Component<Props, State> {
         <div
           style={{
             padding: 24,
-            color: "#E4E7F0",
-            background: "#08090E",
+            color: "rgba(243,246,255,0.94)",
+            background: "#07080c",
             minHeight: "100vh",
-            fontFamily: "system-ui, sans-serif",
+            fontFamily: "'Outfit', system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
           }}
         >
-          <h1 style={{ fontSize: 18, marginBottom: 12 }}>RAGBase — runtime error</h1>
-          <p style={{ color: "#8B92AB", marginBottom: 8 }}>Check the browser console for full details.</p>
+          <h1 style={{ fontSize: 18, marginBottom: 12, letterSpacing: "-0.01em" }}>
+            RAGBase — runtime error
+          </h1>
+          <p style={{ color: "rgba(223,230,242,0.68)", marginBottom: 8 }}>
+            Check the browser console for full details.
+          </p>
           <pre
             style={{
               whiteSpace: "pre-wrap",
-              color: "#EF476F",
+              color: "rgba(251,113,133,0.95)",
               fontSize: 13,
               padding: 12,
-              background: "#171A26",
-              borderRadius: 8,
-              border: "1px solid #252940",
+              background: "rgba(21,23,33,0.82)",
+              borderRadius: 14,
+              border: "1px solid rgba(255,255,255,0.10)",
             }}
           >
             {this.state.message}
@@ -55,12 +59,12 @@ export class RAGBaseErrorBoundary extends Component<Props, State> {
             style={{
               marginTop: 16,
               padding: "8px 16px",
-              borderRadius: 6,
-              border: "none",
+              borderRadius: 12,
+              border: "1px solid rgba(255,255,255,0.10)",
               cursor: "pointer",
-              background: "#7C5CFC",
-              color: "#fff",
-              fontWeight: 600,
+              background: "linear-gradient(135deg, rgba(125,211,252,0.95), rgba(56,189,248,0.85))",
+              color: "rgba(8,10,14,0.92)",
+              fontWeight: 800,
             }}
           >
             Try again

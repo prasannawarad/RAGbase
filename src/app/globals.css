@@ -2,9 +2,226 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  /* RAGBase theme tokens */
+  --bg: #07080c;
+  --surface: rgba(13, 14, 20, 0.86);
+  --surface2: rgba(21, 23, 33, 0.82);
+  --surface3: rgba(34, 37, 52, 0.72);
+  --border: rgba(255, 255, 255, 0.10);
+  --border2: rgba(255, 255, 255, 0.16);
+  --text: rgba(223, 230, 242, 0.68);
+  --text-bright: rgba(243, 246, 255, 0.94);
+  --focus-ring: rgba(125, 211, 252, 0.55);
+  --primary-hover: rgba(125, 211, 252, 0.035);
+
+  --primary: #7dd3fc;
+  --primary2: #38bdf8;
+  --accent: #34d399;
+  --accent2: #a78bfa;
+  --danger: #fb7185;
+  --warn: #fbbf24;
+}
+
 html,
 body,
 #__next {
   height: 100%;
   width: 100%;
+}
+
+/* App-level background texture (subtle, consistent) */
+body {
+  font-family: var(--font-sans), system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  color: var(--text-bright);
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(1200px 800px at 20% 10%, rgba(125, 211, 252, 0.10), transparent 55%),
+    radial-gradient(900px 700px at 80% 30%, rgba(52, 211, 153, 0.06), transparent 60%),
+    radial-gradient(1100px 900px at 50% 90%, rgba(167, 139, 250, 0.04), transparent 55%),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)' opacity='.55'/%3E%3C/svg%3E");
+  background-blend-mode: normal, normal, normal, overlay;
+  background-repeat: no-repeat, no-repeat, no-repeat, repeat;
+  background-size: auto, auto, auto, 180px 180px;
+  background-position: center, center, center, 0 0;
+}
+
+html {
+  color-scheme: dark;
+}
+
+::selection {
+  background: var(--primary);
+  color: white;
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes glow {
+  0%,
+  100% {
+    box-shadow: 0 0 4px var(--primary);
+  }
+  50% {
+    box-shadow: 0 0 20px var(--primary);
+  }
+}
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+@keyframes progressPulse {
+  0%,
+  100% {
+    opacity: 0.8;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.hov {
+  transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  cursor: pointer;
+}
+.hov:hover {
+  transform: translateY(-1px);
+}
+.hov:active {
+  transform: translateY(0px) scale(0.99);
+}
+
+.mono {
+  font-family: var(--font-mono), ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.kicker {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.panel {
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 16px;
+}
+
+.btn-ghost {
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.02);
+  color: rgba(243, 246, 255, 0.92);
+  border-radius: 12px;
+  padding: 8px 12px;
+  font-weight: 650;
+}
+.btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.btn-pri {
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: linear-gradient(135deg, rgba(125, 211, 252, 0.95), rgba(56, 189, 248, 0.85));
+  color: rgba(8, 10, 14, 0.92);
+  border-radius: 14px;
+  padding: 10px 14px;
+  font-weight: 850;
+}
+.btn-pri:hover {
+  transform: translateY(-1px);
+}
+
+input:focus,
+textarea:focus {
+  border-color: var(--primary) !important;
+  outline: none;
+}
+input:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+}
+
+.drop-t {
+  transition: border-color 220ms ease, background-color 220ms ease;
+}
+.drop-t:hover {
+  border-color: var(--focus-ring) !important;
+  background: var(--primary-hover) !important;
+}
+
+/* Scope details marker reset to RAGBase only */
+.ragbase details > summary {
+  list-style: none;
+}
+.ragbase details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.streaming-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 14px;
+  background: var(--primary);
+  margin-left: 2px;
+  animation: blink 0.8s step-end infinite;
+  vertical-align: text-bottom;
 }

@@ -112,6 +112,27 @@ type DocSummary = {
   complexity?: string;
 };
 
+function errorToMessage(err: unknown): string {
+  if (err instanceof Error) return err.message || "Unknown error";
+  if (typeof err === "string") return err;
+  if (!err || typeof err !== "object") return "Unknown error";
+
+  // Browser Event / ErrorEvent / PromiseRejectionEvent sometimes bubbles up here.
+  const anyErr = err as Record<string, unknown>;
+  const msg =
+    (typeof anyErr.message === "string" && anyErr.message) ||
+    (typeof anyErr.type === "string" && anyErr.type) ||
+    (typeof anyErr.name === "string" && anyErr.name) ||
+    "";
+  if (msg) return msg;
+
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return "Unknown error";
+  }
+}
+
 // ─── PDF Extraction ───────────────────────────────────────────
 // Dynamically loads pdf.js from CDN so we don't need a build step.
 // Caches the loaded library in window.pdfjsLib after first load.
@@ -291,7 +312,7 @@ async function fetchRetrieve(params: {
     }
     return { results: data.results ?? [], error: null };
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+    const msg = errorToMessage(e);
     console.error("[API /api/retrieve] network:", e);
     return { results: [], error: msg };
   }
@@ -383,6 +404,10 @@ export default function RAGBase() {
   const chatInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const docFileInputRef = useRef<HTMLInputElement | null>(null);
+  const sourcesBtnRef = useRef<HTMLButtonElement | null>(null);
+  const sourcesCloseBtnRef = useRef<HTMLButtonElement | null>(null);
+  const sourcesDialogRef = useRef<HTMLElement | null>(null);
+  const lastFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     console.log("[RAGBase] mounted");
@@ -403,6 +428,55 @@ export default function RAGBase() {
       document.body.style.overflow = prev;
     };
   }, [sidebarOpen]);
+
+  // ─── Sources drawer: esc-to-close + focus trap + restore focus ─────────
+  useEffect(() => {
+    if (!showRetrieval) return;
+    const openerEl = sourcesBtnRef.current;
+    lastFocusRef.current = document.activeElement as HTMLElement | null;
+    // Move focus into the dialog on open.
+    queueMicrotask(() => sourcesCloseBtnRef.current?.focus());
+    return () => {
+      // Restore focus to opener (or previous focus) on close.
+      queueMicrotask(() => (openerEl ?? lastFocusRef.current)?.focus());
+    };
+  }, [showRetrieval]);
+
+  useEffect(() => {
+    if (!showRetrieval) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setShowRetrieval(false);
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const root = sourcesDialogRef.current;
+      if (!root) return;
+      const focusables = Array.from(
+        root.querySelectorAll<HTMLElement>(
+          'button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])'
+        )
+      ).filter((el) => !el.hasAttribute("disabled") && el.tabIndex !== -1);
+      if (focusables.length === 0) return;
+      const first = focusables[0]!;
+      const last = focusables[focusables.length - 1]!;
+      const active = document.activeElement as HTMLElement | null;
+      if (e.shiftKey) {
+        if (!active || active === first || !root.contains(active)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else {
+        if (!active || active === last || !root.contains(active)) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [showRetrieval]);
 
   // ─── Load documents from Supabase (mount + Retry) ────────────
   const refetchDocuments = useCallback(async () => {
@@ -616,7 +690,7 @@ export default function RAGBase() {
       }, 1000);
     } catch (err: unknown) {
       console.error(err);
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorToMessage(err);
       addLog(`ERROR: ${message}`);
       setError("Processing failed: " + message);
       setProcessing(false);
@@ -642,7 +716,7 @@ export default function RAGBase() {
           if (!text.trim()) throw new Error("No extractable text found in PDF");
           texts.push({ name: file.name, text, pages, fileType: "pdf" });
         } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
+          const message = errorToMessage(err);
           setError(`PDF extraction failed for "${file.name}": ${message}`);
         }
       } else {
@@ -854,7 +928,7 @@ Then end your response with EXACTLY this block (replace values):
             : m
         )
       );
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorToMessage(err));
     } finally {
       setChatLoading(false);
     }
@@ -880,7 +954,7 @@ Then end your response with EXACTLY this block (replace values):
       setChunkSearchResults(results);
     } catch (err: unknown) {
       console.error("[chunk search] unexpected", err);
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorToMessage(err));
       setChunkSearchResults([]);
     } finally {
       setChunkSearchLoading(false);
@@ -904,7 +978,7 @@ ${doc.text.substring(0, 3000)}`
       const { mode: _m, ...parsed } = summaryRes;
       setDocSummaries((prev) => ({ ...prev, [docId]: parsed }));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorToMessage(err));
     } finally {
       setAnalyticsLoading(false);
     }
@@ -967,6 +1041,44 @@ ${doc.text.substring(0, 3000)}`
     setDbSynced(false);
   };
 
+  function renderTextWithCitations(
+    text: string,
+    onCitationClick: (sourceIndex: number) => void
+  ) {
+    const parts = text.split(/(\[Source\s+\d+\])/g);
+    return parts.map((p, idx) => {
+      const m = p.match(/^\[Source\s+(\d+)\]$/);
+      if (!m) return <span key={idx}>{p}</span>;
+      const n = Number(m[1]);
+      if (!Number.isFinite(n) || n <= 0) return <span key={idx}>{p}</span>;
+      return (
+        <button
+          key={idx}
+          type="button"
+          onClick={() => onCitationClick(n - 1)}
+          className="hov mono"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "2px 8px",
+            margin: "0 2px",
+            borderRadius: 999,
+            border: "1px solid rgba(255,255,255,0.12)",
+            background: "rgba(125,211,252,0.08)",
+            color: "rgba(243,246,255,0.92)",
+            fontSize: 11,
+            lineHeight: 1.4,
+            cursor: "pointer",
+            verticalAlign: "baseline",
+          }}
+        >
+          {p}
+        </button>
+      );
+    });
+  }
+
   // ─── Sub-Components ──────────────────────────────────────
   const ConfBadge = ({ level }: { level: string }) => {
     const c: Record<string, string> = { high: "#06D6A0", medium: "#FFD166", low: "#EF476F" };
@@ -975,7 +1087,7 @@ ${doc.text.substring(0, 3000)}`
         fontSize: 10, fontWeight: 800, padding: "2px 8px", borderRadius: 4,
         textTransform: "uppercase", letterSpacing: "0.05em",
         background: (c[level] || c.low) + "18", color: c[level] || c.low,
-        fontFamily: "'IBM Plex Mono', monospace",
+        fontFamily: "var(--font-mono), ui-monospace, monospace",
       }}>{level}</span>
     );
   };
@@ -985,7 +1097,7 @@ ${doc.text.substring(0, 3000)}`
       fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
       background: mode === "hybrid" ? "var(--accent2)" + "18" : "var(--primary)" + "18",
       color: mode === "hybrid" ? "var(--accent2)" : "var(--primary)",
-      fontFamily: "'IBM Plex Mono', monospace", textTransform: "uppercase",
+      fontFamily: "var(--font-mono), ui-monospace, monospace", textTransform: "uppercase",
     }}>{mode === "hybrid" ? "⚡ Hybrid" : "◈ Vector"}</span>
   );
 
@@ -1000,7 +1112,7 @@ ${doc.text.substring(0, 3000)}`
       </div>
       <span style={{
         fontSize: 11, fontWeight: 700, color: "#E4E7F0",
-        fontFamily: "'IBM Plex Mono', monospace", minWidth: 40,
+        fontFamily: "var(--font-mono), ui-monospace, monospace", minWidth: 40,
       }}>{(score * 100).toFixed(1)}%</span>
     </div>
   );
@@ -1177,43 +1289,8 @@ ${doc.text.substring(0, 3000)}`
   // ══════════════════════════════════════════════════════════
   return (
     <div
-      className="flex h-screen w-screen min-h-0 overflow-hidden bg-transparent font-sans text-[var(--text)] transition-all duration-200"
-      style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}
+      className="ragbase flex h-screen w-screen min-h-0 overflow-hidden bg-transparent font-sans text-[var(--text)] transition-all duration-200"
     >
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
-        :root {
-          --bg: #08090E; --surface: #0F1118; --surface2: #171A26; --surface3: #1F2333;
-          --border: #252940; --border2: #343850; --text: #8B92AB; --text-bright: #E4E7F0;
-          --primary: #7C5CFC; --primary2: #5B3FD9; --accent: #06D6A0; --accent2: #3EDBF0;
-          --danger: #EF476F; --warn: #FFD166;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        ::selection { background: var(--primary); color: white; }
-        @keyframes fadeUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-        @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
-        @keyframes slideIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
-        @keyframes glow { 0%,100% { box-shadow: 0 0 4px var(--primary); } 50% { box-shadow: 0 0 20px var(--primary); } }
-        @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
-        @keyframes progressPulse { 0%,100% { opacity: 0.8; } 50% { opacity: 1; } }
-        @keyframes shimmer {
-          0% { background-position: -200% 0; }
-          100% { background-position: 200% 0; }
-        }
-        .hov { transition: all 0.15s ease; cursor: pointer; }
-        .hov:hover { transform: translateY(-1px); }
-        input:focus, textarea:focus { border-color: var(--primary) !important; outline: none; }
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
-        .drop-t { transition: all 0.3s ease; }
-        .drop-t:hover { border-color: var(--primary) !important; background: rgba(124,92,252,0.04) !important; }
-        details > summary { list-style: none; }
-        details > summary::-webkit-details-marker { display: none; }
-        .streaming-cursor { display: inline-block; width: 2px; height: 14px; background: var(--primary); margin-left: 2px; animation: blink 0.8s step-end infinite; vertical-align: text-bottom; }
-      `}</style>
-
       {sidebarOpen && (
         <div
           className="fixed inset-0 z-40 bg-black/50 md:hidden"
@@ -1304,28 +1381,23 @@ ${doc.text.substring(0, 3000)}`
         {view === VIEWS.UPLOAD && !processing && (
           <div className="w-full" style={{ animation: "fadeUp 0.5s ease" }}>
             <div className="mt-4 mb-6 space-y-4 text-center">
+              <div className="kicker">Document intelligence workspace</div>
               <h1 className="text-4xl font-semibold tracking-tight text-[var(--text-bright)] sm:text-5xl">
-                <span style={{ color: "var(--primary)" }}>RAG</span> Pipeline
+                Ask your docs. Prove every claim.
               </h1>
               <p className="mx-auto max-w-2xl text-sm text-white/60 sm:text-base">
-                Full RAG — PDF · TXT · MD · CSV · Hybrid BM25+Vector Search · Supabase pgvector · Streaming Generation
+                Upload a corpus, run hybrid retrieval, and get streaming answers with clickable citations.
               </p>
             </div>
 
             {documentsLoadErrorCard}
 
             {!docsError && !docsLoading && documents.length === 0 && (
-              <p
-                style={{
-                  textAlign: "center",
-                  fontSize: 14,
-                  color: "var(--text)",
-                  marginBottom: 20,
-                  fontFamily: "'IBM Plex Mono', monospace",
-                }}
-              >
-                📂 No documents yet — upload to begin
-              </p>
+              <div className="mx-auto mb-5 max-w-2xl rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3 text-center">
+                <span className="mono text-[11px] text-white/60">
+                  No documents indexed yet. Drop files to start building your knowledge base.
+                </span>
+              </div>
             )}
 
             <input
@@ -1340,33 +1412,51 @@ ${doc.text.substring(0, 3000)}`
             <div
               className="
                 mx-auto w-full max-w-2xl cursor-pointer
-                border border-dashed border-purple-500/30
-                hover:border-purple-400/60
-                transition
-                rounded-xl
-                p-8
-                bg-white/[0.02]
-                text-center
+                rounded-2xl p-8 text-center
+                border border-dashed border-white/12
+                bg-gradient-to-b from-white/[0.04] to-white/[0.015]
+                shadow-[0_20px_60px_rgba(0,0,0,0.45)]
+                transition duration-200
+                hover:border-white/20
               "
               onDragOver={(e) => e.preventDefault()}
               onDrop={handleDrop}
               onClick={() => fileInputRef.current?.click()}
               style={{ marginBottom: 12 }}
             >
-              <div style={{ fontSize: 36, color: "var(--primary)", marginBottom: 10, opacity: 0.5 }}>◈</div>
-              <h3 className="text-base font-bold text-[var(--text-bright)] md:text-lg" style={{ marginBottom: 4 }}>
-                Drop documents here
+              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.03] text-[var(--text-bright)] shadow-[0_10px_30px_rgba(0,0,0,0.35)]">
+                <span className="mono text-sm">KB</span>
+              </div>
+              <h3 className="text-base font-semibold text-[var(--text-bright)] md:text-lg" style={{ marginBottom: 6 }}>
+                Drop files to index
               </h3>
-              <p className="text-sm text-[var(--text)] md:text-base">.pdf · .txt · .md · .csv · Multiple files supported</p>
+              <p className="text-sm text-white/60 md:text-base">
+                PDF, TXT, MD, CSV — multiple files supported.
+              </p>
               <div style={{ marginTop: 12, display: "flex", justifyContent: "center", gap: 6 }}>
-                {["📕 PDF", "📄 TXT", "📝 MD", "📊 CSV"].map((t) => (
-                  <span key={t} style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "var(--surface2)", color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace" }}>{t}</span>
+                {["PDF", "TXT", "MD", "CSV"].map((t) => (
+                  <span
+                    key={t}
+                    className="mono"
+                    style={{
+                      fontSize: 10,
+                      padding: "3px 10px",
+                      borderRadius: 999,
+                      background: "rgba(255,255,255,0.03)",
+                      border: "1px solid rgba(255,255,255,0.10)",
+                      color: "rgba(243,246,255,0.78)",
+                    }}
+                  >
+                    {t}
+                  </span>
                 ))}
               </div>
             </div>
 
             <div style={{ textAlign: "center", margin: "14px 0" }}>
-              <button onClick={handlePasteText} className="hov" style={{ ...S.btnOut, padding: "10px 24px" }}>📋 Paste Text</button>
+              <button onClick={handlePasteText} className="hov btn-ghost">
+                Paste text
+              </button>
             </div>
 
             {/* Architecture overview */}
@@ -1534,11 +1624,12 @@ ${doc.text.substring(0, 3000)}`
               </div>
               <div className="flex shrink-0 flex-wrap gap-2">
                 <button
-                  onClick={() => setShowRetrieval(!showRetrieval)}
+                  ref={sourcesBtnRef}
+                  onClick={() => setShowRetrieval((v) => !v)}
                   className="hov"
                   style={{ ...S.btnOut, padding: "5px 12px", fontSize: 11, borderColor: showRetrieval ? "var(--primary)" : "var(--border)" }}
                 >
-                  {showRetrieval ? "Hide" : "Show"} Retrieval
+                  Sources
                 </button>
                 <button onClick={() => setChatMessages([])} className="hov" style={{ ...S.btnOut, padding: "5px 12px", fontSize: 11 }}>Clear</button>
               </div>
@@ -1549,9 +1640,47 @@ ${doc.text.substring(0, 3000)}`
               <div className="flex min-h-0 min-w-0 flex-1 flex-col">
                 <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pb-2.5">
                   {chatMessages.length === 0 && (
-                    <div style={{ textAlign: "center", padding: "40px 20px", opacity: 0.5 }}>
-                      <div style={{ fontSize: 36, marginBottom: 8 }}>◈</div>
-                      <p style={{ fontSize: 13, color: "var(--text)" }}>Ask anything about your documents. Answers stream live with source citations.</p>
+                    <div className="panel mx-auto w-full max-w-[720px] p-4 sm:p-5">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0">
+                          <div className="kicker">Start a session</div>
+                          <div className="mt-1 text-sm font-semibold text-[var(--text-bright)]">
+                            Ask a question about your indexed documents
+                          </div>
+                          <div className="mt-1 text-xs text-white/55">
+                            Tip: click any <span className="mono">[Source N]</span> pill to open the sources drawer.
+                          </div>
+                        </div>
+                        <div className="flex gap-2">
+                          {[
+                            "Summarize the main themes across the documents.",
+                            "What are the key risks mentioned? Cite sources.",
+                            "List important numbers and where they appear.",
+                          ].map((q) => (
+                            <button
+                              key={q}
+                              type="button"
+                              className="hov mono"
+                              onClick={() => {
+                                setChatInput(q);
+                                chatInputRef.current?.focus();
+                              }}
+                              style={{
+                                padding: "8px 10px",
+                                borderRadius: 12,
+                                border: "1px solid rgba(255,255,255,0.10)",
+                                background: "rgba(255,255,255,0.02)",
+                                color: "rgba(243,246,255,0.78)",
+                                fontSize: 11,
+                                maxWidth: 220,
+                                textAlign: "left",
+                              }}
+                            >
+                              {q}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
                     </div>
                   )}
 
@@ -1562,14 +1691,26 @@ ${doc.text.substring(0, 3000)}`
                       animation: "fadeUp 0.3s ease",
                     }}>
                       {msg.role === "user" ? (
-                        <div style={{ maxWidth: "72%", padding: "10px 14px", borderRadius: "10px 10px 2px 10px", background: "linear-gradient(135deg, var(--primary), var(--primary2))", color: "white" }}>
-                          <p style={{ fontSize: 13, lineHeight: 1.5 }}>{msg.text}</p>
-                          <p style={{ fontSize: 9, opacity: 0.6, marginTop: 4, textAlign: "right", fontFamily: "'IBM Plex Mono', monospace" }}>{msg.timestamp}</p>
+                        <div
+                          style={{
+                            maxWidth: "72%",
+                            padding: "11px 14px",
+                            borderRadius: "16px 16px 4px 16px",
+                            background:
+                              "linear-gradient(135deg, rgba(125,211,252,0.95), rgba(56,189,248,0.80))",
+                            color: "rgba(8,10,14,0.92)",
+                            boxShadow: "0 18px 50px rgba(0,0,0,0.40)",
+                          }}
+                        >
+                          <p style={{ fontSize: 13, lineHeight: 1.55, fontWeight: 550 }}>{msg.text}</p>
+                          <p className="mono" style={{ fontSize: 9, opacity: 0.7, marginTop: 6, textAlign: "right" }}>
+                            {msg.timestamp}
+                          </p>
                         </div>
                       ) : msg.streaming ? (
                         /* ─── Streaming message ─── */
-                        <div style={{ maxWidth: "82%", padding: "12px 16px", borderRadius: "10px 10px 10px 2px", background: "var(--surface2)", border: "1px solid var(--primary)" + "33" }}>
-                          <div style={{ fontSize: 9, color: "var(--primary)", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                        <div style={{ maxWidth: "82%", padding: "12px 16px", borderRadius: "16px 16px 16px 4px", background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.10)" }}>
+                          <div className="mono" style={{ fontSize: 10, color: "rgba(125,211,252,0.9)", marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
                             <span style={{ animation: "pulse 1s infinite" }}>⟳</span> Generating…
                           </div>
                           <p style={{ fontSize: 13, color: "var(--text-bright)", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
@@ -1579,47 +1720,40 @@ ${doc.text.substring(0, 3000)}`
                         </div>
                       ) : (
                         /* ─── Final assistant message ─── */
-                        <div style={{ maxWidth: "82%", padding: "12px 16px", borderRadius: "10px 10px 10px 2px", background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                        <div style={{ maxWidth: "82%", padding: "14px 16px", borderRadius: "16px 16px 16px 4px", background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.10)" }}>
                           <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
                             <ConfBadge level={msg.confidence} />
                             <SearchModeBadge mode={msg.searchMode} />
-                            <span style={{ fontSize: 9, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace" }}>{msg.timestamp}</span>
+                            <span className="mono" style={{ fontSize: 10, color: "rgba(255,255,255,0.55)" }}>{msg.timestamp}</span>
                           </div>
-                          <p style={{ fontSize: 13, color: "var(--text-bright)", lineHeight: 1.7, marginBottom: 10, whiteSpace: "pre-wrap" }}>
-                            {msg.text}
+                          <p style={{ fontSize: 13, color: "var(--text-bright)", lineHeight: 1.8, marginBottom: 10, whiteSpace: "pre-wrap" }}>
+                            {renderTextWithCitations(msg.text, (sourceIdx) => {
+                              const src = msg.retrievedChunks[sourceIdx];
+                              if (!src) return;
+                              setLastRetrieved(msg.retrievedChunks);
+                              setShowRetrieval(true);
+                            })}
                           </p>
                           {msg.retrievedChunks.length > 0 && (
-                            <div style={{ marginBottom: 10 }}>
-                              <p style={{ fontSize: 10, color: "var(--text)", marginBottom: 6, fontFamily: "'IBM Plex Mono', monospace", textTransform: "uppercase", letterSpacing: "0.04em" }}>
-                                Sources
-                              </p>
-                              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                                {msg.retrievedChunks.map((s) => (
-                                  <button
-                                    key={s.id}
-                                    type="button"
-                                    onClick={() => goToRetrievedSource(s)}
-                                    className="hov"
-                                    style={{
-                                      textAlign: "left",
-                                      padding: "6px 10px",
-                                      borderRadius: 6,
-                                      border: "1px solid var(--border)",
-                                      background: "var(--surface)",
-                                      color: "var(--text-bright)",
-                                      fontSize: 11,
-                                      cursor: "pointer",
-                                      fontFamily: "'IBM Plex Mono', monospace",
-                                      lineHeight: 1.4,
-                                    }}
-                                  >
-                                    📄 {s.documentName} — chunk {s.chunkIndex}
-                                    <span style={{ display: "block", fontSize: 10, color: "var(--text)", marginTop: 4, fontWeight: 400 }}>
-                                      {s.contentSnippet}
-                                    </span>
-                                  </button>
-                                ))}
-                              </div>
+                            <div style={{ marginBottom: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setLastRetrieved(msg.retrievedChunks);
+                                  setShowRetrieval(true);
+                                }}
+                                className="hov mono"
+                                style={{
+                                  padding: "6px 10px",
+                                  borderRadius: 999,
+                                  border: "1px solid var(--border)",
+                                  background: "rgba(255,255,255,0.02)",
+                                  color: "var(--text-bright)",
+                                  fontSize: 11,
+                                }}
+                              >
+                                Open sources ({msg.retrievedChunks.length})
+                              </button>
                             </div>
                           )}
                           {msg.keyEntities?.length > 0 && (
@@ -1691,38 +1825,108 @@ ${doc.text.substring(0, 3000)}`
                 </div>
               </div>
 
-              {/* Retrieval Panel */}
-              {showRetrieval && lastRetrieved.length > 0 && (
-                <div className="max-h-[min(50vh,calc(100vh-140px))] w-full shrink-0 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3.5 lg:max-h-none lg:w-[290px] lg:self-stretch">
-                  <h4 style={{ fontSize: 11, fontWeight: 700, color: "var(--primary)", textTransform: "uppercase", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 4 }}>
-                    Retrieved Chunks ({lastRetrieved.length})
-                  </h4>
-                  <p style={{ fontSize: 9, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 10 }}>
-                    {useHybridSearch ? "BM25 + Vector → RRF scores" : "Cosine similarity scores"}
-                  </p>
-                  {lastRetrieved.map((c, i) => (
-                    <div key={c.id} style={{ padding: "8px", marginBottom: 6, background: "var(--surface2)", borderRadius: 4, borderLeft: `2px solid ${i === 0 ? "var(--primary)" : "var(--border)"}` }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                        <span style={{ fontSize: 10, color: "var(--accent2)", fontFamily: "'IBM Plex Mono', monospace" }}>
-                          {c.documentName.length > 18 ? c.documentName.substring(0, 18) + "…" : c.documentName}
-                          <span style={{ color: "var(--text)" }}> · #{c.chunkIndex}</span>
-                        </span>
-                      </div>
-                      {useHybridSearch ? (
-                        <div style={{ fontSize: 9, fontFamily: "'IBM Plex Mono', monospace", color: "var(--text)", marginBottom: 4 }}>
-                          <span style={{ color: "var(--primary)" }}>vec {((c.vectorScore ?? 0) * 100).toFixed(0)}%</span>
-                          {" · "}
-                          <span style={{ color: "var(--accent2)" }}>bm25 {c.bm25Score?.toFixed(2)}</span>
+              {/* Sources Drawer */}
+              {showRetrieval && (
+                <>
+                  <div
+                    className="fixed inset-0 z-[60] bg-black/40"
+                    aria-hidden="true"
+                    onClick={() => setShowRetrieval(false)}
+                  />
+                  <aside
+                    className="
+                      fixed right-0 top-0 z-[70] h-full w-[min(420px,92vw)]
+                      border-l border-white/10 bg-[#07080c]/80
+                      shadow-[0_30px_80px_rgba(0,0,0,0.6)]
+                      backdrop-blur-lg
+                    "
+                    role="dialog"
+                    aria-modal="true"
+                    aria-label="Sources"
+                    ref={sourcesDialogRef as unknown as React.RefObject<HTMLElement>}
+                  >
+                    <div className="flex h-full flex-col">
+                      <div className="flex items-start justify-between gap-3 border-b border-white/10 px-4 py-3">
+                        <div className="min-w-0">
+                          <div className="mono text-[10px] uppercase tracking-[0.18em] text-white/60">
+                            Sources · {lastRetrieved.length}
+                          </div>
+                          <div className="mt-1 text-sm font-semibold text-[var(--text-bright)]">
+                            Retrieved chunks
+                          </div>
+                          <div className="mt-1 text-xs text-white/50">
+                            {useHybridSearch ? "Hybrid fusion (BM25 + vector → RRF)" : "Vector similarity"}
+                          </div>
                         </div>
-                      ) : (
-                        <ScoreBar score={c.score ?? 0} />
-                      )}
-                      <div style={{ marginTop: 4, fontSize: 10, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace", lineHeight: 1.4 }}>
-                        {c.contentSnippet}
+                        <button
+                          type="button"
+                          onClick={() => setShowRetrieval(false)}
+                          ref={sourcesCloseBtnRef}
+                          className="hov mono"
+                          style={{
+                            padding: "8px 10px",
+                            borderRadius: 12,
+                            border: "1px solid rgba(255,255,255,0.10)",
+                            background: "rgba(255,255,255,0.02)",
+                            color: "rgba(243,246,255,0.94)",
+                            fontSize: 11,
+                          }}
+                        >
+                          Close (Esc)
+                        </button>
+                      </div>
+
+                      <div className="flex-1 overflow-y-auto px-3 py-3">
+                        {lastRetrieved.length === 0 ? (
+                          <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 text-sm text-white/60">
+                            Ask a question to generate sources.
+                          </div>
+                        ) : (
+                          <div className="flex flex-col gap-2">
+                            {lastRetrieved.map((c, i) => (
+                              <button
+                                key={c.id}
+                                type="button"
+                                onClick={() => {
+                                  setShowRetrieval(false);
+                                  goToRetrievedSource(c);
+                                }}
+                                className="hov"
+                                style={{
+                                  textAlign: "left",
+                                  padding: "10px 12px",
+                                  borderRadius: 16,
+                                  border: "1px solid rgba(255,255,255,0.10)",
+                                  background:
+                                    i === 0
+                                      ? "linear-gradient(180deg, rgba(125,211,252,0.10), rgba(255,255,255,0.02))"
+                                      : "rgba(255,255,255,0.02)",
+                                  color: "rgba(243,246,255,0.94)",
+                                }}
+                              >
+                                <div className="flex items-center justify-between gap-3">
+                                  <div className="min-w-0">
+                                    <div className="mono text-[10px] text-white/60">
+                                      [Source {i + 1}] · {c.documentName} · #{c.chunkIndex}
+                                    </div>
+                                  </div>
+                                  <div className="mono text-[10px] text-white/55">
+                                    {useHybridSearch
+                                      ? `vec ${(((c.vectorScore ?? 0) * 100) | 0)} · bm25 ${c.bm25Score?.toFixed(2) ?? "—"}`
+                                      : `${(((c.score ?? 0) * 100) | 0)}%`}
+                                  </div>
+                                </div>
+                                <div className="mt-2 text-xs leading-relaxed text-white/70">
+                                  {c.contentSnippet}
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     </div>
-                  ))}
-                </div>
+                  </aside>
+                </>
               )}
             </div>
           </div>
@@ -2201,25 +2405,25 @@ ${doc.text.substring(0, 3000)}`
 const S: Record<string, CSSProperties> = {
   sidebarTop: { padding: "16px 14px", borderBottom: "1px solid var(--border)" },
   logoRow: { display: "flex", alignItems: "center", gap: 8 },
-  logoGem: { width: 30, height: 30, borderRadius: 7, background: "linear-gradient(135deg, var(--primary), var(--primary2))", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontWeight: 800, fontSize: 14, fontFamily: "'IBM Plex Mono', monospace" },
-  logoTitle: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 14, fontWeight: 800, color: "var(--text-bright)" },
+  logoGem: { width: 30, height: 30, borderRadius: 8, background: "linear-gradient(135deg, rgba(125,211,252,0.95), rgba(56,189,248,0.85))", display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(8,10,14,0.92)", fontWeight: 850, fontSize: 14, fontFamily: "'JetBrains Mono', ui-monospace, monospace" },
+  logoTitle: { fontFamily: "'JetBrains Mono', ui-monospace, monospace", fontSize: 13, fontWeight: 800, color: "var(--text-bright)", letterSpacing: "-0.01em" },
   logoSub: { fontSize: 9, color: "var(--text)" },
   sidebarNav: { padding: "10px 6px" },
-  navItem: { width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 5, background: "transparent", border: "none", fontFamily: "'Plus Jakarta Sans', sans-serif", fontWeight: 600, color: "var(--text-bright)", cursor: "pointer", marginBottom: 1, textAlign: "left" },
-  badge: { fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 8, background: "var(--primary)" + "22", color: "var(--primary)", fontFamily: "'IBM Plex Mono', monospace" },
+  navItem: { width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "9px 10px", borderRadius: 8, background: "transparent", border: "none", fontFamily: "'Outfit', system-ui, sans-serif", fontWeight: 600, color: "var(--text-bright)", cursor: "pointer", marginBottom: 2, textAlign: "left" },
+  badge: { fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 999, background: "rgba(125,211,252,0.12)", color: "rgba(125,211,252,0.95)", fontFamily: "'JetBrains Mono', ui-monospace, monospace", fontVariantNumeric: "tabular-nums" },
   statItem: { display: "flex", flexDirection: "column", alignItems: "center", gap: 2 },
   sidebarFoot: { padding: "10px 6px", borderTop: "1px solid var(--border)" },
-  input: { width: "100%", padding: "8px 12px", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 5, color: "var(--text-bright)", fontSize: 12, fontFamily: "'Plus Jakarta Sans', sans-serif" },
-  selectInput: { padding: "8px 10px", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 5, color: "var(--text-bright)", fontSize: 12, fontFamily: "'IBM Plex Mono', monospace", minWidth: 140 },
-  btnPri: { padding: "8px 18px", background: "linear-gradient(135deg, var(--primary), var(--primary2))", border: "none", borderRadius: 5, color: "white", fontSize: 12, fontWeight: 700, fontFamily: "'Plus Jakarta Sans', sans-serif", cursor: "pointer", whiteSpace: "nowrap" },
-  btnOut: { padding: "8px 16px", background: "transparent", border: "1px solid var(--border)", borderRadius: 5, color: "var(--text-bright)", fontSize: 12, fontWeight: 600, fontFamily: "'Plus Jakarta Sans', sans-serif", cursor: "pointer" },
-  btnDanger: { padding: "8px 14px", background: "var(--danger)" + "18", border: "1px solid var(--danger)" + "33", borderRadius: 5, color: "var(--danger)", fontSize: 11, fontWeight: 700, fontFamily: "'Plus Jakarta Sans', sans-serif", cursor: "pointer" },
+  input: { width: "100%", padding: "9px 12px", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 10, color: "var(--text-bright)", fontSize: 12, fontFamily: "'Outfit', system-ui, sans-serif" },
+  selectInput: { padding: "9px 10px", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 10, color: "var(--text-bright)", fontSize: 12, fontFamily: "'JetBrains Mono', ui-monospace, monospace", minWidth: 140, fontVariantNumeric: "tabular-nums" },
+  btnPri: { padding: "9px 16px", background: "linear-gradient(135deg, rgba(125,211,252,0.95), rgba(56,189,248,0.85))", border: "1px solid rgba(255,255,255,0.10)", borderRadius: 12, color: "rgba(8,10,14,0.92)", fontSize: 12, fontWeight: 800, fontFamily: "'Outfit', system-ui, sans-serif", cursor: "pointer", whiteSpace: "nowrap", boxShadow: "0 10px 30px rgba(0,0,0,0.35)" },
+  btnOut: { padding: "9px 14px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)", borderRadius: 12, color: "var(--text-bright)", fontSize: 12, fontWeight: 650, fontFamily: "'Outfit', system-ui, sans-serif", cursor: "pointer" },
+  btnDanger: { padding: "9px 14px", background: "rgba(251,113,133,0.10)", border: "1px solid rgba(251,113,133,0.22)", borderRadius: 12, color: "rgba(251,113,133,0.95)", fontSize: 11, fontWeight: 750, fontFamily: "'Outfit', system-ui, sans-serif", cursor: "pointer" },
   errorBar: { display: "flex", alignItems: "center", gap: 8, background: "var(--danger)" + "10", border: "1px solid var(--danger)" + "33", borderRadius: 6, padding: "8px 14px", marginBottom: 12, fontSize: 12, color: "var(--danger)" },
-  card: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "16px 18px", marginBottom: 10 },
-  cardTitle: { fontSize: 11, fontWeight: 700, color: "var(--primary)", textTransform: "uppercase", letterSpacing: "0.05em", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 12 },
+  card: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: "16px 18px", marginBottom: 10, boxShadow: "0 12px 40px rgba(0,0,0,0.35)" },
+  cardTitle: { fontSize: 11, fontWeight: 750, color: "rgba(125,211,252,0.90)", textTransform: "uppercase", letterSpacing: "0.08em", fontFamily: "'JetBrains Mono', ui-monospace, monospace", marginBottom: 12 },
   viewHead: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16, flexWrap: "wrap", gap: 10 },
   progressTrack: { height: 4, background: "var(--surface3)", borderRadius: 2, overflow: "hidden", width: "100%" },
   progressFill: { height: "100%", borderRadius: 2, background: "linear-gradient(90deg, var(--primary), var(--accent))", transition: "width 0.5s ease", animation: "progressPulse 1.5s ease infinite" },
-  cfgLabel: { display: "block", fontSize: 10, fontWeight: 700, color: "var(--text)", textTransform: "uppercase", letterSpacing: "0.05em", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 4 },
-  cfgVal: { textAlign: "right", fontSize: 13, fontWeight: 800, color: "var(--primary)", fontFamily: "'IBM Plex Mono', monospace", marginTop: 2 },
+  cfgLabel: { display: "block", fontSize: 10, fontWeight: 700, color: "var(--text)", textTransform: "uppercase", letterSpacing: "0.08em", fontFamily: "'JetBrains Mono', ui-monospace, monospace", marginBottom: 4 },
+  cfgVal: { textAlign: "right", fontSize: 13, fontWeight: 850, color: "rgba(125,211,252,0.95)", fontFamily: "'JetBrains Mono', ui-monospace, monospace", marginTop: 2, fontVariantNumeric: "tabular-nums" },
 };
