@@ -6,7 +6,7 @@
 
 ## 🔗 Live Demo
 
-**Production:** [https://ragbase-gamma.vercel.app](https://ragbase-gamma.vercel.app)
+**Production:** [https://ragbase.prasannawarad.com](https://ragbase.prasannawarad.com)
 
 ---
 
@@ -221,7 +221,7 @@ npm run build
 npm start
 ```
 
-**Live:** [https://ragbase-gamma.vercel.app](https://ragbase-gamma.vercel.app)
+**Live:** [https://ragbase.prasannawarad.com](https://ragbase.prasannawarad.com)
 
 ---
 
