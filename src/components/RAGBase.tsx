@@ -286,6 +286,8 @@ async function fetchRetrieve(params: {
   query: string;
   topK: number;
   useHybrid: boolean;
+  rerank?: boolean;
+  rewrite?: boolean;
   filterDocumentId?: string | null;
 }): Promise<FetchRetrieveResult> {
   try {
@@ -296,6 +298,8 @@ async function fetchRetrieve(params: {
         query: params.query,
         topK: params.topK,
         useHybrid: params.useHybrid,
+        rerank: params.rerank ?? false,
+        rewrite: params.rewrite ?? false,
         filterDocumentId: params.filterDocumentId ?? null,
       }),
     });
@@ -397,6 +401,8 @@ export default function RAGBase() {
   const [topK, setTopK] = useState(5);
   const [similarityThreshold, setSimilarityThreshold] = useState(0.3);
   const [useHybridSearch, setUseHybridSearch] = useState(true);  // NEW: BM25 + Vector
+  const [useRerank, setUseRerank] = useState(false);   // LLM listwise rerank (2nd stage)
+  const [useRewrite, setUseRewrite] = useState(false); // LLM query rewrite before retrieval
 
   const [error, setError] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -793,6 +799,8 @@ export default function RAGBase() {
         query: question,
         topK,
         useHybrid: useHybridSearch,
+        rerank: useRerank,
+        rewrite: useRewrite,
       });
       if (retrieveErr) {
         console.warn("[chat] retrieval failed; continuing with empty context:", retrieveErr);
@@ -2311,6 +2319,52 @@ ${doc.text.substring(0, 3000)}`
                   <span style={{ color: "var(--accent2)", fontWeight: 700 }}>RRF formula:</span>{" "}
                   score(d) = Σ 1/(k + rank_i(d)) where k=60 — ranks are fused across BM25 and vector rankings.
                   This is the same approach used by Elasticsearch&apos;s hybrid search.
+                </div>
+
+                {/* Advanced retrieval stages */}
+                <div style={{ marginTop: 14 }}>
+                  <h4 style={{ fontSize: 12, fontWeight: 700, color: "var(--text-bright)", marginBottom: 8 }}>⚙️ Advanced retrieval stages (LLM-powered)</h4>
+                  <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+                    {[
+                      {
+                        label: "LLM Reranking",
+                        checked: useRerank,
+                        toggle: () => setUseRerank((v) => !v),
+                        desc: "Fetches 4× more candidates, then a listwise LLM pass re-orders them for precision against your question. Adds ~1-3s latency per query.",
+                        best: "Boosts context precision",
+                      },
+                      {
+                        label: "Query Rewriting",
+                        checked: useRewrite,
+                        toggle: () => setUseRewrite((v) => !v),
+                        desc: "An LLM expands your question with synonyms and normalized terms before embedding + BM25. The original question is still used for the answer.",
+                        best: "Helps vague or short queries",
+                      },
+                    ].map((opt) => (
+                      <div
+                        key={opt.label}
+                        onClick={opt.toggle}
+                        style={{
+                          padding: 12, borderRadius: 6, cursor: "pointer",
+                          border: `1px solid ${opt.checked ? "var(--accent)" : "var(--border)"}`,
+                          background: opt.checked ? "var(--accent)" + "08" : "var(--surface2)",
+                          transition: "all 0.2s ease",
+                        }}
+                      >
+                        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
+                          <div style={{
+                            width: 12, height: 12, borderRadius: 3,
+                            border: `2px solid ${opt.checked ? "var(--accent)" : "var(--border2)"}`,
+                            background: opt.checked ? "var(--accent)" : "transparent",
+                            flexShrink: 0,
+                          }} />
+                          <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-bright)" }}>{opt.label}</span>
+                        </div>
+                        <p style={{ fontSize: 11, color: "var(--text)", lineHeight: 1.5, marginBottom: 6 }}>{opt.desc}</p>
+                        <span style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", color: "var(--accent)" }}>{opt.best}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
 

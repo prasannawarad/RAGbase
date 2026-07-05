@@ -44,7 +44,7 @@ This makes it closer to systems like **Perplexity, Glean, or enterprise knowledg
 
 * 📄 Multi-format document upload (PDF, TXT, MD, CSV)
 * ✂️ Sentence-aware chunking with overlap
-* 🧠 Server-side embeddings (Gemini `text-embedding-004`, 768-dim)
+* 🧠 Server-side embeddings (Gemini `gemini-embedding-001`, 768-dim)
 * 🔍 Hybrid search (BM25 + vector similarity + RRF)
 * ⚡ Streaming AI responses via Groq (SSE) with Gemini fallback
 * 📚 Source attribution (document + chunk-level) with **clickable** `[Source N]` citations
@@ -63,7 +63,7 @@ This makes it closer to systems like **Perplexity, Glean, or enterprise knowledg
 | Frontend | Next.js 15 (App Router), React 19, TypeScript |
 | Backend | Next.js API routes (Node runtime) |
 | Database | Supabase (PostgreSQL + pgvector) |
-| Embeddings | Google Gemini (`text-embedding-004`) |
+| Embeddings | Google Gemini (`gemini-embedding-001`) |
 | LLM (primary) | Groq (`llama-3.3-70b-versatile`) |
 | LLM (fallback) | Google Gemini (`gemini-2.0-flash`) |
 | Search | BM25 + vector similarity + RRF |
@@ -111,7 +111,7 @@ Client → /api/retrieve → embed query (Gemini) → BM25 + vector → RRF → 
 
 * **Groq as primary LLM** — fast inference; failover to Gemini when needed
 * **Gemini as LLM fallback** — automatic backup if Groq quota or availability fails
-* **Gemini for embeddings** — `text-embedding-004` produces 768-dim vectors matching the pgvector schema
+* **Gemini for embeddings** — `gemini-embedding-001` (truncated to 768 dims, L2-normalized) produces vectors matching the pgvector schema
 * **Server-side embeddings** — consistency, security, centralized control
 * **Hybrid search (BM25 + vector)** — better recall than pure vector search
 * **Reciprocal Rank Fusion (RRF)** — balances lexical and semantic ranking

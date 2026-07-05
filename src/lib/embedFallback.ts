@@ -1,4 +1,4 @@
-/** Deterministic L2-normalized pseudo-embedding when Gemini is unavailable (same dim as text-embedding-004). */
+/** Deterministic L2-normalized pseudo-embedding when Gemini is unavailable (same 768 dims as gemini-embedding-001). */
 const EMBED_DIM = 768;
 
 export function mockEmbedding(text: string): number[] {

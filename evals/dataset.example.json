@@ -1,0 +1,25 @@
+{
+  "description": "Golden dataset for RAGBase evals. Copy to evals/dataset.json and replace with questions about documents YOU have ingested. expectedAnswer is optional but improves the correctness judgment.",
+  "items": [
+    {
+      "id": "q1",
+      "question": "What is the main topic of the document?",
+      "expectedAnswer": "Replace with the ideal answer grounded in your ingested document."
+    },
+    {
+      "id": "q2",
+      "question": "A specific factual question answerable from one chunk.",
+      "expectedAnswer": "The specific fact."
+    },
+    {
+      "id": "q3",
+      "question": "A question requiring information from multiple chunks or documents.",
+      "expectedAnswer": "A synthesized answer spanning sections."
+    },
+    {
+      "id": "q4",
+      "question": "A question your documents do NOT answer (tests refusal / no-hallucination).",
+      "expectedAnswer": "The assistant should say the context is insufficient."
+    }
+  ]
+}

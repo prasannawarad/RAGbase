@@ -8,52 +8,83 @@ function getApiKey(): string {
   return key.trim();
 }
 
-/**
- * Batch embedding via Gemini text-embedding-004 (768 dimensions per vector).
- * Batches of 20 to match API limits.
- */
-export async function embedTexts(texts: string[]): Promise<number[][]> {
-  const apiKey = getApiKey();
-  const results: number[][] = [];
-  const batchSize = 20;
+const EMBEDDING_MODEL = "gemini-embedding-001";
+export const EMBEDDING_DIMS = 768;
 
-  for (let i = 0; i < texts.length; i += batchSize) {
-    const batch = texts.slice(i, i + batchSize);
-    const requests = batch.map((text) => ({
-      model: "models/text-embedding-004",
-      content: { parts: [{ text }] },
-    }));
+// gemini-2.0-flash has zero free-tier generateContent quota (July 2026);
+// flash-lite is the tier that still serves free requests.
+export const GEMINI_TEXT_MODEL = "gemini-2.5-flash-lite";
 
+function l2Normalize(values: number[]): number[] {
+  const norm = Math.sqrt(values.reduce((sum, v) => sum + v * v, 0));
+  if (!norm) return values;
+  return values.map((v) => v / norm);
+}
+
+async function embedOne(text: string, apiKey: string, retries = 3): Promise<number[]> {
+  for (let attempt = 0; ; attempt++) {
     const res = await fetch(
-      `${GEMINI_API_BASE}/models/text-embedding-004:batchEmbedContents?key=${encodeURIComponent(apiKey)}`,
+      `${GEMINI_API_BASE}/models/${EMBEDDING_MODEL}:embedContent?key=${encodeURIComponent(apiKey)}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requests }),
+        body: JSON.stringify({
+          content: { parts: [{ text }] },
+          outputDimensionality: EMBEDDING_DIMS,
+        }),
       }
     );
 
     const data = (await res.json()) as {
       error?: { message?: string };
-      embeddings?: { values: number[] }[];
+      embedding?: { values: number[] };
     };
+
+    if (res.status === 429 && attempt < retries) {
+      // Free tier allows 100 embed requests/min; respect the suggested delay.
+      const suggested = data.error?.message?.match(/retry in ([\d.]+)s/i);
+      const delayMs = suggested ? Math.ceil(parseFloat(suggested[1]) * 1000) + 1000 : 45_000;
+      console.warn(`[gemini] embed rate-limited, retrying in ${Math.round(delayMs / 1000)}s`);
+      await new Promise((r) => setTimeout(r, delayMs));
+      continue;
+    }
 
     if (!res.ok || data.error) {
       throw new Error(data.error?.message || "Embedding API error");
     }
-
-    const batchEmb = data.embeddings?.map((e) => e.values) ?? [];
-    if (batchEmb.length !== batch.length) {
-      throw new Error("Embedding API returned incomplete batch");
+    const values = data.embedding?.values;
+    if (!values || values.length !== EMBEDDING_DIMS) {
+      throw new Error("Embedding API returned unexpected dimensions");
     }
-    results.push(...batchEmb);
+    // Truncated (non-3072) gemini-embedding-001 vectors are not unit length;
+    // normalize so L2 distance ranking in pgvector stays meaningful.
+    return l2Normalize(values);
+  }
+}
+
+/**
+ * Embedding via gemini-embedding-001 truncated to 768 dims (matches the
+ * pgvector vector(768) column). The model has no batch endpoint, so requests
+ * run with limited concurrency.
+ */
+export async function embedTexts(texts: string[]): Promise<number[][]> {
+  const apiKey = getApiKey();
+  const results: number[][] = new Array(texts.length);
+  const concurrency = 8;
+
+  for (let i = 0; i < texts.length; i += concurrency) {
+    const batch = texts.slice(i, i + concurrency);
+    const vectors = await Promise.all(batch.map((text) => embedOne(text, apiKey)));
+    vectors.forEach((v, j) => {
+      results[i + j] = v;
+    });
   }
 
   return results;
 }
 
 /**
- * Text generation via Gemini gemini-2.0-flash (non-streaming).
+ * Text generation via Gemini (non-streaming).
  */
 export async function generateText(
   prompt: string,
@@ -62,7 +93,7 @@ export async function generateText(
   const apiKey = getApiKey();
 
   const res = await fetch(
-    `${GEMINI_API_BASE}/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
+    `${GEMINI_API_BASE}/models/${GEMINI_TEXT_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -161,7 +192,7 @@ export async function openGeminiChatTextStream(
   options?: { temperature?: number; maxOutputTokens?: number }
 ): Promise<ReadableStream<Uint8Array>> {
   const apiKey = getApiKey();
-  const url = `${GEMINI_API_BASE}/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+  const url = `${GEMINI_API_BASE}/models/${GEMINI_TEXT_MODEL}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
 
   const res = await fetch(url, {
     method: "POST",

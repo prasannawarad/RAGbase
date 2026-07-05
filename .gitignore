@@ -35,3 +35,7 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
+
+# evals (local golden dataset + run outputs)
+/evals/dataset.json
+/evals/results/

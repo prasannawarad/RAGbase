@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
-import { generateText as generateGroq, openGroqChatTextStream } from "@/lib/groq";
-import { generateText as generateGemini, openGeminiChatTextStream } from "@/lib/gemini";
+import { generateText as generateGroq, openGroqChatTextStream, groqModelName } from "@/lib/groq";
+import { generateText as generateGemini, openGeminiChatTextStream, GEMINI_TEXT_MODEL } from "@/lib/gemini";
+import { startTrace, flushTraces, tapTextStream } from "@/lib/observability";
+
+const GROQ_MODEL = groqModelName();
+const GEMINI_MODEL = GEMINI_TEXT_MODEL;
 
 function parseSummaryFromModel(raw: string): {
   summary: string;
@@ -72,18 +76,36 @@ export async function POST(req: Request) {
     const isSummary =
       prompt.includes("Summarize this document") && prompt.includes("Respond ONLY in JSON");
 
+    const trace = startTrace(isSummary ? "chat-summary" : "chat-rag", {
+      input: { prompt },
+      tags: [isSummary ? "summary" : "rag"],
+    });
+
     if (isSummary) {
       let raw: string;
+      let model = GROQ_MODEL;
+      const gen = trace?.generation({
+        name: "summary",
+        input: prompt,
+        model,
+        modelParameters: { temperature: 0.4, max_tokens: 3000 },
+      });
       try {
         raw = await generateGroq(prompt, { temperature: 0.4, maxOutputTokens: 3000 });
       } catch {
         try {
+          model = GEMINI_MODEL;
           raw = await generateGemini(prompt, { temperature: 0.4, maxOutputTokens: 3000 });
         } catch {
+          gen?.end({ output: null, level: "ERROR", statusMessage: "all providers failed" });
+          await flushTraces();
           return NextResponse.json(FALLBACK_SUMMARY);
         }
       }
+      gen?.end({ output: raw, model });
       const parsed = parseSummaryFromModel(raw);
+      trace?.update({ output: parsed ?? { error: "unparseable summary" } });
+      await flushTraces();
       if (parsed) {
         return NextResponse.json({
           mode: "summary",
@@ -93,26 +115,60 @@ export async function POST(req: Request) {
       return NextResponse.json(FALLBACK_SUMMARY);
     }
 
+    const streamResponse = (stream: ReadableStream<Uint8Array>, model: string) => {
+      if (!trace) return new Response(stream, { headers: streamHeaders });
+      const gen = trace.generation({
+        name: "rag-answer",
+        input: prompt,
+        model,
+        modelParameters: { temperature: 0.3, max_tokens: 3000 },
+      });
+      const tapped = tapTextStream(stream, async (fullText) => {
+        gen.end({ output: fullText });
+        trace.update({ output: { text: fullText, streamed: true, model } });
+        await flushTraces();
+      });
+      return new Response(tapped, { headers: streamHeaders });
+    };
+
+    const traceCompletion = async (text: string, model: string) => {
+      if (!trace) return;
+      trace.generation({
+        name: "rag-answer",
+        input: prompt,
+        model,
+        modelParameters: { temperature: 0.3, max_tokens: 3000 },
+        output: text,
+        endTime: new Date(),
+      });
+      trace.update({ output: { text, streamed: false, model } });
+      await flushTraces();
+    };
+
     try {
       const stream = await openGroqChatTextStream(prompt, { temperature: 0.3, maxOutputTokens: 3000 });
-      return new Response(stream, { headers: streamHeaders });
+      return streamResponse(stream, GROQ_MODEL);
     } catch (groqStreamErr) {
       console.warn("[api/chat] Groq stream failed:", groqStreamErr);
       try {
         const stream = await openGeminiChatTextStream(prompt, { temperature: 0.3, maxOutputTokens: 3000 });
-        return new Response(stream, { headers: streamHeaders });
+        return streamResponse(stream, GEMINI_MODEL);
       } catch (geminiStreamErr) {
         console.warn("[api/chat] Gemini stream failed:", geminiStreamErr);
         try {
           const text = await generateGroq(prompt, { temperature: 0.3, maxOutputTokens: 3000 });
+          await traceCompletion(text, GROQ_MODEL);
           return jsonTextFromCompletion(text);
         } catch (groqTextErr) {
           console.warn("[api/chat] Groq generateText failed:", groqTextErr);
           try {
             const text = await generateGemini(prompt, { temperature: 0.3, maxOutputTokens: 3000 });
+            await traceCompletion(text, GEMINI_MODEL);
             return jsonTextFromCompletion(text);
           } catch (geminiTextErr) {
             console.warn("[api/chat] Gemini generateText failed:", geminiTextErr);
+            trace?.update({ output: { error: "all providers failed" } });
+            await flushTraces();
             return NextResponse.json({ mode: "text", text: FALLBACK_TEXT });
           }
         }

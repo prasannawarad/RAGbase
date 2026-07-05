@@ -1,6 +1,12 @@
 import Groq from "groq-sdk";
 
-const MODEL = "llama-3.3-70b-versatile";
+// Overridable because Groq free-tier token budgets are per-model — switching
+// models is the only way to keep working after one model's daily quota is spent.
+const MODEL = process.env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile";
+
+export function groqModelName(): string {
+  return MODEL;
+}
 
 function getApiKey(): string {
   const key = process.env.GROQ_API_KEY;
