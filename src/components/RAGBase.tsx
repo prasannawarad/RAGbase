@@ -60,6 +60,8 @@ type StoredDocument = {
   pages?: number | null;
   fileType?: string;
   status?: string;
+  chunksDone?: number;
+  error?: string | null;
   uploadedAt?: string;
 };
 
@@ -179,6 +181,59 @@ async function readJsonOnce<T>(res: Response): Promise<{ parsed: T | null; parse
     return { parsed, parseError: false };
   } catch {
     return { parsed: null, parseError: true };
+  }
+}
+
+type IngestProgress = {
+  status: "queued" | "processing" | "indexed" | "failed";
+  chunksDone: number;
+  chunkCount: number;
+  error?: string;
+  retrying?: boolean;
+};
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Drives server-side ingestion of one document to completion by calling the idempotent
+ * /api/ingest/:id/process endpoint until the document is indexed or failed. Safe to call again
+ * after a reload: the server keeps the staged chunks, so work resumes where it stopped.
+ */
+async function driveIngestion(
+  docId: string,
+  onProgress: (p: IngestProgress) => void,
+  opts: { retry?: boolean } = {}
+): Promise<IngestProgress> {
+  let query = opts.retry ? "?retry=1" : "";
+  let lastDone = -1;
+  let stalls = 0;
+  for (;;) {
+    const res = await fetch(`/api/ingest/${docId}/process${query}`, { method: "POST" });
+    query = "";
+    if (res.status === 429) {
+      await sleep((Number(res.headers.get("Retry-After")) || 5) * 1000);
+      continue;
+    }
+    if (res.status === 401) {
+      window.location.href = "/login";
+      throw new Error("Session expired");
+    }
+    const { parsed, parseError } = await readJsonOnce<IngestProgress & { code?: string }>(res);
+    if (!res.ok || parseError || !parsed) {
+      throw new Error((!parseError && parsed?.error) || `Ingestion step failed (${res.status})`);
+    }
+    onProgress(parsed);
+    if (parsed.status === "indexed" || parsed.status === "failed") return parsed;
+
+    if (parsed.chunksDone > lastDone) {
+      stalls = 0;
+      lastDone = parsed.chunksDone;
+    } else {
+      // No progress (embedding error being retried, or another tab holds the lease): back off.
+      stalls++;
+      if (stalls > 20) throw new Error("Ingestion is not making progress");
+      await sleep(Math.min(2000 * stalls, 15000));
+    }
   }
 }
 
@@ -485,10 +540,12 @@ export default function RAGBase() {
   }, [showRetrieval]);
 
   // ─── Load documents from Supabase (mount + Retry) ────────────
-  const refetchDocuments = useCallback(async () => {
+  const refetchDocuments = useCallback(async (quiet = false) => {
     try {
-      setDbLoading(true);
-      setDocsLoading(true);
+      if (!quiet) {
+        setDbLoading(true);
+        setDocsLoading(true);
+      }
       const res = await fetch("/api/documents");
       if (res.status === 401) {
         // Session expired mid-use — middleware will send us to the login page.
@@ -524,7 +581,7 @@ export default function RAGBase() {
       setTotalChunks(data.totalChunks ?? 0);
       if (docs.length) {
         setDbSynced(true);
-        setView(VIEWS.CHAT);
+        if (!quiet) setView(VIEWS.CHAT);
       }
     } catch (error: unknown) {
       console.error("Documents API failed:", error);
@@ -533,14 +590,49 @@ export default function RAGBase() {
       setDocsError(error instanceof Error ? error.message : "Failed to load documents");
       setDbSynced(false);
     } finally {
-      setDbLoading(false);
-      setDocsLoading(false);
+      if (!quiet) {
+        setDbLoading(false);
+        setDocsLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
     void refetchDocuments();
   }, [refetchDocuments]);
+
+  // Resume ingestion for documents left unfinished (tab closed or reloaded mid-upload).
+  const resumingRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const d of documents) {
+      if ((d.status !== "queued" && d.status !== "processing") || resumingRef.current.has(d.id)) continue;
+      resumingRef.current.add(d.id);
+      void driveIngestion(d.id, (p) =>
+        setDocuments((prev) =>
+          prev.map((x) => (x.id === d.id ? { ...x, status: p.status, chunksDone: p.chunksDone, error: p.error ?? null } : x))
+        )
+      )
+        .then(() => refetchDocuments(true))
+        .catch((err) => console.error("[resume ingestion]", d.id, err))
+        .finally(() => resumingRef.current.delete(d.id));
+    }
+  }, [documents, refetchDocuments]);
+
+  const retryIngestion = (docId: string) => {
+    if (resumingRef.current.has(docId)) return;
+    resumingRef.current.add(docId);
+    void driveIngestion(
+      docId,
+      (p) =>
+        setDocuments((prev) =>
+          prev.map((x) => (x.id === docId ? { ...x, status: p.status, chunksDone: p.chunksDone, error: p.error ?? null } : x))
+        ),
+      { retry: true }
+    )
+      .then(() => refetchDocuments(true))
+      .catch((err) => setError(errorToMessage(err)))
+      .finally(() => resumingRef.current.delete(docId));
+  };
 
   useEffect(() => {
     if (view !== VIEWS.CHUNKS || !documents.length) {
@@ -621,12 +713,12 @@ export default function RAGBase() {
             (doc.pages ? ` · ${doc.pages} pages` : "")
         );
 
-        setProcessStep(`Ingesting "${doc.name}" (${chunks.length} chunks, server-side embeddings)...`);
+        setProcessStep(`Queueing "${doc.name}" (${chunks.length} chunks)...`);
         const pct = 5 + Math.round((processedChunks / Math.max(totalChunkEstimate, 1)) * 75);
         setProcessProgress(pct);
 
         const chunkTexts = chunks.map((c) => c.text);
-        addLog(`POST /api/ingest — ${chunkTexts.length} chunks (embed + persist on server)`);
+        addLog(`POST /api/ingest — queueing ${chunkTexts.length} chunks`);
 
         const ingestPayload: {
           documentName: string;
@@ -676,7 +768,24 @@ export default function RAGBase() {
           throw new Error("Invalid response from ingest API");
         }
         if (!payload.document) throw new Error("Ingest returned no document");
-        createdDocs.push(payload.document);
+        let finalDoc = payload.document;
+        if ((payload as { duplicate?: boolean }).duplicate) {
+          addLog(`"${doc.name}" was already uploaded — reusing the existing copy (no embedding quota spent)`);
+        }
+        if (finalDoc.status !== "indexed") {
+          addLog(`Embedding "${doc.name}" in batches (resumable)…`);
+          const base = processedChunks;
+          const progress = await driveIngestion(finalDoc.id, (p) => {
+            setProcessStep(`Embedding "${doc.name}" — ${p.chunksDone}/${p.chunkCount} chunks`);
+            setProcessProgress(5 + Math.round(((base + p.chunksDone) / Math.max(totalChunkEstimate, 1)) * 75));
+          });
+          if (progress.status === "failed") {
+            throw new Error(`"${doc.name}" could not be indexed: ${progress.error ?? "unknown error"}. You can retry it from the Documents tab.`);
+          }
+          finalDoc = { ...finalDoc, status: "indexed", chunksDone: progress.chunksDone };
+        }
+        // A duplicate upload returns the existing document: don't list it twice.
+        if (!documents.some((d) => d.id === finalDoc.id)) createdDocs.push(finalDoc);
         processedChunks += chunks.length;
       }
 
@@ -1571,6 +1680,23 @@ ${doc.text.substring(0, 3000)}`
                           <span>{doc.wordCount.toLocaleString()} words</span>
                           <span>·</span>
                           <span>{doc.chunks} chunks</span>
+                          {doc.status && doc.status !== "indexed" && (
+                            <>
+                              <span>·</span>
+                              {doc.status === "failed" ? (
+                                <span style={{ color: "var(--danger)" }}>
+                                  failed{doc.error ? ` — ${doc.error}` : ""}{" "}
+                                  <button type="button" className="hov" style={{ textDecoration: "underline" }} onClick={() => retryIngestion(doc.id)}>
+                                    Retry
+                                  </button>
+                                </span>
+                              ) : (
+                                <span style={{ color: "var(--warn)" }}>
+                                  embedding {doc.chunksDone ?? 0}/{doc.chunks}…
+                                </span>
+                              )}
+                            </>
+                          )}
                           <span>·</span>
                           <span>avg {doc.avgChunkSize} chars/chunk</span>
                           <span>·</span>

@@ -161,7 +161,8 @@ supabase/
     ├── 003_documents_full_insert_contract.sql
     ├── 004_grants_postgrest_reload.sql
     ├── 005_auth_tenancy.sql
-    └── 006_search_indexes.sql
+    ├── 006_search_indexes.sql
+    └── 007_background_ingestion.sql
 ```
 
 ---
@@ -212,8 +213,9 @@ In the Supabase **SQL Editor**, run the migrations **in order**:
 4. `supabase/migrations/004_grants_postgrest_reload.sql`
 5. `supabase/migrations/005_auth_tenancy.sql` — per-user ownership + Row Level Security
 6. `supabase/migrations/006_search_indexes.sql` — HNSW + full-text indexes, indexed hybrid search (`match_chunks`, `hybrid_search_chunks`)
+7. `supabase/migrations/007_background_ingestion.sql` — resumable ingestion (staging table, claim function, dedup)
 
-Migration 001 enables `vector` and creates `documents` and `chunks` (768-dim). Run all six in sequence. Then enable **Authentication → Allow anonymous sign-ins** if you want the "Continue as guest" button. Existing data needs a one-time backfill — see `docs/ARCHITECTURE.md` §7. Design decisions are logged in `docs/ARCHITECTURE.md`.
+Migration 001 enables `vector` and creates `documents` and `chunks` (768-dim). Run all seven in sequence. Then enable **Authentication → Allow anonymous sign-ins** if you want the "Continue as guest" button. Existing data needs a one-time backfill — see `docs/ARCHITECTURE.md` §7. Design decisions are logged in `docs/ARCHITECTURE.md`.
 
 ### 5. Run locally
 

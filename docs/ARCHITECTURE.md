@@ -20,6 +20,7 @@ flowchart LR
   R -->|3 parseBody + zod| R
   R -->|user JWT, RLS applies| DB[(Postgres + pgvector<br/>HNSW + GIN indexes)]
   R -->|rate limits + caches| RD[(Upstash Redis<br/>optional)]
+  B -->|poll /api/ingest/id/process| R
   R --> LLM[Groq / Gemini<br/>fallback chain]
   R -.->|optional| LF[Langfuse tracing]
 ```
@@ -48,7 +49,7 @@ Contracts: every route's request schema lives in `src/lib/api/schemas.ts`; every
 | 1 | Auth (Supabase), tenancy, RLS | 🧪 code done; needs migration 005 + dashboard steps |
 | 2 | HNSW index, indexed hybrid search, migrations | 🧪 code done; needs migration 006 |
 | 3 | Redis rate limiting + caching | 🧪 code done; works without Redis, needs Upstash credentials to take effect |
-| 4 | Background ingestion | 📋 |
+| 4 | Resumable background ingestion | 🧪 code done; needs migration 007 |
 | 5 | Connection security (headers, CSP, CORS, cookie flags) | 📋 |
 | 6 | Observability (structured logs, Sentry, health) | 📋 |
 | 7 | Frontend split, Docker, environments, runbook | 📋 |
@@ -241,6 +242,80 @@ Not cached: **chat answers** (LLM output; belongs with the later LLM-governance 
   (Rate limiting *can* fall back to memory because the worst case is a looser limit, not wrong data.)
 - **Override:** _______________________
 
+## 5c. Decisions — Stage 4: background ingestion
+
+```mermaid
+sequenceDiagram
+  participant UI as Browser
+  participant API as /api/ingest
+  participant W as /api/ingest/:id/process
+  participant DB as Postgres
+  participant G as Gemini
+  UI->>API: chunks (text only)
+  API->>DB: document status=queued + ingest_chunks (staging)
+  API-->>UI: 202 {document}
+  loop until indexed or failed
+    UI->>W: process
+    W->>DB: claim_ingest_batch (lease, SKIP LOCKED)
+    W->>G: embed 8 chunks
+    W->>DB: upsert chunks, delete staged, progress
+    W-->>UI: {status, chunksDone, chunkCount}
+  end
+```
+
+### D4.1 Where the work runs
+- **Options:** (a) keep embedding inside the upload request · (b) browser drives an idempotent `process` endpoint ·
+  (c) message queue (Upstash QStash) calling a worker route · (d) Postgres `pg_cron` + Edge Function
+- **Chosen:** (b), written so (c) can replace the driver without touching the worker.
+- **Why:** (a) is the bug being fixed — a 3,000-chunk document needs 3,000 Gemini calls at ≤100/min, far beyond a
+  serverless request. (c) is the "real" background answer but needs a public callback URL (not localhost), signing-key
+  verification and one more service; (d) is Supabase-specific and harder to run locally. (b) works everywhere today,
+  stays resumable, and `processDocument()` takes no browser input.
+- **Honest trade-off:** if the user closes the tab, embedding *pauses* (it resumes automatically the next time the app
+  loads, because staged text lives in the database). It is resumable, not unattended.
+- **Interview answer:** "Ingestion is a state machine in the database, advanced by an idempotent worker endpoint.
+  Who calls it — the browser now, a queue later — is a deployment detail."
+- **Override:** _______________________
+
+### D4.2 Staging table instead of a nullable embedding column
+- **Chosen:** `ingest_chunks(document_id, chunk_index, content, attempts, claimed_at)`; real rows only ever land in `chunks`.
+- **Why:** `chunks` stays an invariant — *every row is searchable and has a real vector* — so search functions and the HNSW
+  index need no `WHERE embedding IS NOT NULL`. Pending work and finished data have different lifecycles and are stored apart.
+- **Override:** _______________________
+
+### D4.3 Concurrency: leases, not locks held across the network call
+- **Chosen:** `claim_ingest_batch()` — one `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING *` that stamps
+  `claimed_at` and bumps `attempts`. A lease (120 s) expires if the worker dies. Chunk writes are upserts on
+  `(document_id, chunk_index)`.
+- **Why:** two tabs (or a retry plus a resume) can call `process` at once. `SKIP LOCKED` gives each caller *different* rows
+  without blocking; holding a row lock for the length of a Gemini call would stall everyone; the upsert makes a crash between
+  "write chunks" and "delete staging" harmless.
+- **Verified:** on a real Postgres with two concurrent sessions — A claimed rows 0–4 and, while A still held its transaction,
+  B claimed 5–9 in 50 ms; expired leases are re-claimable; chunk rewrite yields one row (`supabase/tests/ingest_claim.sql`).
+- **Override:** _______________________
+
+### D4.4 Status model and failure policy
+- **Chosen:** `queued → processing → indexed | failed`, plus `chunks_done`, `error`. An embedding error releases the claim and
+  the caller retries; after **3 attempts per chunk** the document becomes `failed` with the message, staged text is kept, and
+  the UI offers **Retry** (resets attempts).
+- **Why:** quota errors are usually transient (retry), but an infinite retry loop burns the day's quota — so failure is bounded
+  and visible. Partially indexed documents are searchable while processing; the document list shows `embedding 12/40…`.
+- **Override:** _______________________
+
+### D4.5 ⚠ Behaviour change — no silent mock embeddings at ingest
+- **What changed:** the old ingest path swallowed any Gemini error and stored deterministic **mock vectors**. The worker now
+  retries and then fails the document instead. The mock fallback is still used for *query* embeddings, and ingest can opt back in
+  with `ALLOW_MOCK_EMBEDDINGS=true` (offline demos).
+- **Why this deviates from "keep fallback chains intact":** a mock vector written to the database is permanent — retrieval for
+  that document is near-random until a full `npm run reembed`, and nothing signals it. A visible `failed` state plus Retry is
+  recoverable; silent corruption is not. This is the one place the fallback does more harm than good.
+- **Override:** _______________________ *(if you disagree, set `ALLOW_MOCK_EMBEDDINGS=true` — no code change needed)*
+
+### D4.6 Idempotent uploads
+- **Chosen:** SHA-256 of the chunk text, unique per user (`documents_user_hash_uidx`). A repeat upload returns the existing
+  document (`duplicate: true`) and spends no embedding quota; a race between two identical uploads is settled by the unique index.
+- **Override:** _______________________
+
 ## 6. Known limitations (be honest about these)
 
 - **HNSW + tenant filter can under-return.** pgvector applies the `user_id` filter *after* the index
@@ -249,8 +324,11 @@ Not cached: **chat answers** (LLM output; belongs with the later LLM-governance 
   here because it errors on older pgvector), or partition by tenant. Tiny tenants are safe — the planner
   switches to a btree plan (tested with a 1-chunk user next to a 20,000-chunk user).
 - **Without Upstash credentials the rate limiter is in-memory** (per serverless instance, resets on cold start) and nothing is cached. Set `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` to get the shared limits and caches. The Redis path is covered by mocked tests only — it has not been run against a real Upstash database yet.
-- **Embedding fallback is silent** — a Gemini embedding outage degrades retrieval to near-random while
-  returning 200. Made loud in Stage 6.
+- **Query-time embedding fallback is still silent** — a Gemini outage degrades *search* to near-random while
+  returning 200 (ingest no longer does this, see D4.5). Made loud in Stage 6.
+- **Ingestion pauses if the browser is closed** (D4.1) and resumes on the next visit; a queue would remove this.
+- **Gemini's free tier (~100 embed calls/min) is the throughput ceiling:** a 3,000-chunk document takes ~30 min.
+  Batches of 8 with automatic back-off stay inside the limit, but they don't raise it.
 - **`GET /api/documents` returns every document's full text.** Pagination belongs with the Stage 7 UI split.
 - **Not yet verified against your live Supabase project** — see §7. Everything in §1–5 was verified
   by unit tests (54), a production build, and a scratch-Postgres run of the migrations.
@@ -272,7 +350,10 @@ Do these in order. Applying the code before the SQL will break ingest and search
    `npm run eval`, also set `EVAL_EMAIL` / `EVAL_PASSWORD` for an account that owns the documents the
    golden dataset asks about.
 7. Re-run `npm run eval -- --mode both` and compare with the pre-change results in `evals/results/`.
-8. **Optional (Stage 3):** create a free Upstash Redis database, copy its REST URL and token into
+8. **Stage 4:** run `007_background_ingestion.sql` (after 005/006). Existing documents are marked complete automatically.
+   Then upload a document: it should appear immediately as `embedding n/N…` and finish as indexed; reload mid-upload and it
+   resumes.
+9. **Optional (Stage 3):** create a free Upstash Redis database, copy its REST URL and token into
    `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` (local `.env.local` and Vercel). No SQL needed.
    Verify with two identical retrieve calls: the second should return `X-Cache: HIT`.
 

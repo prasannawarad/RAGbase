@@ -17,6 +17,8 @@ function mapRow(row: Record<string, unknown>) {
     pages: (row.pages as number | null) ?? null,
     fileType: (row.file_type as string) ?? "text",
     status: (row.status as string) ?? "indexed",
+    chunksDone: (row.chunks_done as number) ?? 0,
+    error: (row.error as string | null) ?? null,
     uploadedAt: uploaded ? new Date(uploaded).toLocaleString() : undefined,
   };
 }

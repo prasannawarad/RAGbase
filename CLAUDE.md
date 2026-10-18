@@ -39,6 +39,7 @@ Copy `.env.example` to `.env.local`. Required keys:
 | `NEXT_PUBLIC_SUPABASE_URL` | Browser-safe project URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **Required.** Browser-safe anon key; all API data access runs as the logged-in user under RLS |
 | `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | Optional — Upstash Redis for shared rate limits + caches. Unset = in-memory limiter, caching off |
+| `ALLOW_MOCK_EMBEDDINGS` | Optional — `true` re-enables mock vectors at *ingest* (offline demos). Default off on purpose |
 | `DAILY_CHAT_LIMIT` | Optional — per-user daily chat cap (default 300) |
 | `EVAL_EMAIL` / `EVAL_PASSWORD` | Account `npm run eval` signs in as (must own the eval documents) |
 | `ALLOWED_ORIGINS` | Optional — comma-separated extra origins allowed to call API routes (see API abuse guard). Deployment host + localhost-in-dev are always allowed |
@@ -51,7 +52,7 @@ RAGBase is a Next.js 15 App Router application with a single-page UI backed by A
 
 ### Data flow
 
-**Ingest**: Client sends text chunks → `POST /api/ingest` → embeds via Gemini `gemini-embedding-001` truncated to 768 dims and L2-normalized in `src/lib/gemini.ts` (the model's non-3072 outputs are not unit length; `text-embedding-004` was retired by Google) → inserts into Supabase `documents` + `chunks` tables as the logged-in user (`user_id` set on both; pgvector `vector(768)` column). If the embedding model ever changes, run `npm run reembed` — query and chunk vectors must come from the same model.
+**Ingest** (two steps, resumable): Client sends text chunks → `POST /api/ingest` validates, dedups by content hash and stores the chunk *text* in `ingest_chunks` (document `status: queued`, 202) → the client calls `POST /api/ingest/:id/process` repeatedly; each call claims batches (`claim_ingest_batch`, leased, `SKIP LOCKED`), embeds via Gemini `gemini-embedding-001` truncated to 768 dims and L2-normalized in `src/lib/gemini.ts` (the model's non-3072 outputs are not unit length; `text-embedding-004` was retired by Google) → upserts real rows into `chunks` as the logged-in user (`user_id` set; pgvector `vector(768)` column) until the document is `indexed` (or `failed` after 3 attempts per chunk; the UI offers Retry). `processDocument()` in `src/lib/ingestWorker.ts` holds the logic behind an `IngestStore` interface (unit-tested with a fake). **Ingest does NOT fall back to mock embeddings** (they would be stored permanently) unless `ALLOW_MOCK_EMBEDDINGS=true`; query-time embedding still falls back. Unfinished documents auto-resume when the app loads. If the embedding model ever changes, run `npm run reembed` — query and chunk vectors must come from the same model.
 
 **Retrieve**: Client query → `POST /api/retrieve` → embed query → Supabase RPC (both run in Postgres on indexes and are scoped to the caller by RLS):
 - Vector-only: `match_chunks` (HNSW ANN, L2 distance)
@@ -95,7 +96,8 @@ Order matters — each layer rejects early: `await guardRequest` (origin + per-I
 
 Two tables, applied via numbered, idempotent migrations in `supabase/migrations/` (run in the Supabase SQL editor in order; 005 has a manual backfill step — see `docs/ARCHITECTURE.md` §7):
 
-- `documents` — user_id (owner), name, raw_text, char_count, word_count, chunk_count, avg_chunk_size, pages, file_type, status, uploaded_at
+- `documents` — user_id (owner), name, raw_text, char_count, word_count, chunk_count, avg_chunk_size, pages, file_type, status (`queued|processing|indexed|failed`), chunks_done, error, content_hash (unique per user), uploaded_at
+- `ingest_chunks` — staging for text awaiting embedding (document_id, chunk_index, content, attempts, claimed_at); rows are deleted as they become `chunks`
 - `chunks` — user_id, document_id (FK + cascade delete), chunk_index, content, embedding `vector(768)`, word_count, metadata jsonb, `fts` (generated tsvector)
 
 Indexes (006): HNSW on `embedding` (`vector_l2_ops`), GIN on `fts`, btree on `user_id`/`document_id`. RPCs (`match_chunks`, `hybrid_search_chunks`) are `SECURITY INVOKER` so RLS applies; `anon` has no access to tables or functions. Known limit: HNSW applies the tenant filter after the index scan, so mid-sized tenants can under-return at scale (see ARCHITECTURE §6).
