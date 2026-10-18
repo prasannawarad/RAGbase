@@ -140,7 +140,7 @@ async function retrieve(
   const t0 = Date.now();
   const res = await fetch(`${BASE}/api/retrieve`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders },
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", ...authHeaders },
     body: JSON.stringify({
       query: item.question,
       topK: TOP_K,

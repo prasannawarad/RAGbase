@@ -5,15 +5,20 @@ import { requireUser } from "@/lib/auth";
 import { toVectorParam } from "@/lib/search";
 import { embedTexts } from "@/lib/gemini";
 import { mockEmbeddingsForTexts } from "@/lib/embedFallback";
-import { guardRequest } from "@/lib/apiGuard";
+import { guardDailyBudget, guardRequest, guardUser } from "@/lib/apiGuard";
+import { bumpUserCacheVersion } from "@/lib/cache";
 
 export async function POST(req: Request) {
   // Writes rows + burns embedding quota — keep it low.
-  const blocked = guardRequest(req, { name: "ingest", limit: 10 });
+  const blocked = await guardRequest(req, { name: "ingest", limit: 10 });
   if (blocked) return blocked;
   const auth = await requireUser(req);
   if (!auth.ok) return auth.response;
   const { supabase, user } = auth;
+  const perUser =
+    (await guardUser(user.id, { name: "ingest", limit: 10 })) ??
+    (await guardDailyBudget(user.id, "ingest", 100));
+  if (perUser) return perUser;
 
   const parsed = await parseBody(req, ingestSchema, LIMITS.bodyBytesIngest);
   if (!parsed.ok) return parsed.response;
@@ -111,6 +116,9 @@ export async function POST(req: Request) {
 
     return apiError(500, "internal_error", "Failed to insert chunks", devDetails(chunkError.message));
   }
+
+  // New chunks exist: orphan this user's cached retrieval results.
+  await bumpUserCacheVersion(user.id);
 
   return NextResponse.json({
     document: {

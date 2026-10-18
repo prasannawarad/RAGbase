@@ -38,6 +38,8 @@ Copy `.env.example` to `.env.local`. Required keys:
 | `SUPABASE_SERVICE_ROLE_KEY` | Bypasses RLS — admin scripts only (`npm run reembed`). The web app never uses it; there is no service-role client in `src/` |
 | `NEXT_PUBLIC_SUPABASE_URL` | Browser-safe project URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **Required.** Browser-safe anon key; all API data access runs as the logged-in user under RLS |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | Optional — Upstash Redis for shared rate limits + caches. Unset = in-memory limiter, caching off |
+| `DAILY_CHAT_LIMIT` | Optional — per-user daily chat cap (default 300) |
 | `EVAL_EMAIL` / `EVAL_PASSWORD` | Account `npm run eval` signs in as (must own the eval documents) |
 | `ALLOWED_ORIGINS` | Optional — comma-separated extra origins allowed to call API routes (see API abuse guard). Deployment host + localhost-in-dev are always allowed |
 
@@ -70,12 +72,18 @@ Embedding also falls back: Gemini → `embedFallback.ts` (deterministic mock, sa
 
 ### Request pipeline (every data route)
 
-Order matters — each layer rejects early: `guardRequest` (origin + rate limit) → `requireUser(req)` (`src/lib/auth.ts`) → `parseBody(req, schema)` (`src/lib/api/http.ts`, schemas in `src/lib/api/schemas.ts`) → query via the **user-scoped** client, so Row Level Security applies.
+Order matters — each layer rejects early: `await guardRequest` (origin + per-IP limit) → `requireUser(req)` (`src/lib/auth.ts`) → `guardUser` / `guardDailyBudget` (per-user limits) → `parseBody(req, schema)` (`src/lib/api/http.ts`, schemas in `src/lib/api/schemas.ts`) → query via the **user-scoped** client, so Row Level Security applies.
 
 - **Auth**: Supabase Auth. Browser uses cookie sessions (`@supabase/ssr`, refreshed by `src/middleware.ts`, which redirects signed-out page loads to `/login`); CLI tools send `Authorization: Bearer <access_token>`. `/api/*` is never redirected — routes return 401 JSON. Login page has email/password and "Continue as guest" (Supabase anonymous sign-ins).
 - **Tenancy**: `documents.user_id` and `chunks.user_id` + RLS policies (migration 005). Never add a service-role client to request handling — it would bypass isolation.
 - **Contracts**: all errors are `{ error: string, code: string, ... }` via `apiError()`; DB details are only returned outside production.
-- **Abuse guard** (`src/lib/apiGuard.ts`): same-origin check (403 for browser requests from foreign origins; no-Origin curl passes) and a per-IP **in-memory** fixed-window rate limit (`chat` 20/min, `retrieve` 30/min, `embed` 20/min, `ingest` 10/min, `documents` DELETE 20/min, delete-all 5/min). It is per warm serverless instance and resets on cold start. The GET routes (`documents`, `documents/[id]/chunks`) are not rate-limited, only auth-gated.
+- **Abuse guard** (`src/lib/apiGuard.ts` + `src/lib/rateLimit.ts`): same-origin check (403 for browser requests from foreign origins; no-Origin curl passes), per-IP and per-user limits (`chat` 20/min, `retrieve` 30/min, `embed` 20/min, `ingest` 10/min, `documents` DELETE 20/min, delete-all 5/min) and daily budgets (`chat` 300, `ingest` 100). Backend is Upstash sliding window when configured, else per-instance in-memory (resets on cold start). Redis errors/slowness (>1.5 s) fall back to memory — never to "allow all". `guardRequest` is **async**: always `await` it (an un-awaited call returns a truthy Promise). The GET routes (`documents`, `documents/[id]/chunks`) are not rate-limited, only auth-gated.
+
+### Caching (`src/lib/cache.ts`, needs Redis; no-op without it)
+
+- Query embeddings (`embedCache.ts`, 7 d) and whole retrieve responses (`retrievalCache.ts`, 5 min, per user). Responses carry `X-Cache: HIT|MISS|BYPASS`; send `Cache-Control: no-cache` to bypass (the eval harness does).
+- Invalidation = per-user generation counter in the key; ingest and both DELETE routes call `bumpUserCacheVersion(user.id)`. **Any new route that writes documents/chunks must bump it**, or users get stale search results.
+- Never cache anything derived from `embedFallback.ts` mock vectors. No in-memory cache fallback by design (can't be invalidated across instances). Chat answers and document lists are intentionally not cached — see `docs/ARCHITECTURE.md` D3.4.
 
 ### Observability & evals
 

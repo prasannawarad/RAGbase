@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { __resetGuardForTests, guardRequest } from "@/lib/apiGuard";
+import { __resetGuardForTests, guardDailyBudget, guardRequest, guardUser } from "@/lib/apiGuard";
 
 function req(headers: Record<string, string> = {}) {
   return new Request("http://localhost/api/x", { method: "POST", headers });
@@ -11,44 +11,61 @@ describe("guardRequest: rate limit", () => {
   it("allows up to the limit then returns 429 with Retry-After", async () => {
     const h = { "x-forwarded-for": "1.1.1.1" };
     for (let i = 0; i < 3; i++) {
-      expect(guardRequest(req(h), { name: "t", limit: 3 })).toBeNull();
+      expect(await guardRequest(req(h), { name: "t", limit: 3 })).toBeNull();
     }
-    const blocked = guardRequest(req(h), { name: "t", limit: 3 });
+    const blocked = await guardRequest(req(h), { name: "t", limit: 3 });
     expect(blocked?.status).toBe(429);
     expect(Number(blocked?.headers.get("Retry-After"))).toBeGreaterThan(0);
     expect((await blocked!.json()).code).toBe("rate_limited");
   });
 
-  it("tracks IPs and route names independently", () => {
+  it("tracks IPs and route names independently", async () => {
     const a = { "x-forwarded-for": "1.1.1.1" };
     const b = { "x-forwarded-for": "2.2.2.2" };
-    expect(guardRequest(req(a), { name: "t", limit: 1 })).toBeNull();
-    expect(guardRequest(req(a), { name: "t", limit: 1 })?.status).toBe(429);
-    expect(guardRequest(req(b), { name: "t", limit: 1 })).toBeNull();
-    expect(guardRequest(req(a), { name: "other", limit: 1 })).toBeNull();
+    expect(await guardRequest(req(a), { name: "t", limit: 1 })).toBeNull();
+    expect((await guardRequest(req(a), { name: "t", limit: 1 }))?.status).toBe(429);
+    expect(await guardRequest(req(b), { name: "t", limit: 1 })).toBeNull();
+    expect(await guardRequest(req(a), { name: "other", limit: 1 })).toBeNull();
   });
 
-  it("uses the first x-forwarded-for hop as the client IP", () => {
+  it("uses the first x-forwarded-for hop as the client IP", async () => {
     const h = { "x-forwarded-for": "3.3.3.3, 10.0.0.1" };
-    expect(guardRequest(req(h), { name: "t", limit: 1 })).toBeNull();
+    expect(await guardRequest(req(h), { name: "t", limit: 1 })).toBeNull();
     expect(
-      guardRequest(req({ "x-forwarded-for": "3.3.3.3, 99.9.9.9" }), { name: "t", limit: 1 })?.status
+      (await guardRequest(req({ "x-forwarded-for": "3.3.3.3, 99.9.9.9" }), { name: "t", limit: 1 }))?.status
     ).toBe(429);
   });
 });
 
 describe("guardRequest: origin check", () => {
-  it("lets requests without Origin/Referer through (curl, server-to-server)", () => {
-    expect(guardRequest(req(), { name: "o", limit: 5 })).toBeNull();
+  it("lets requests without Origin/Referer through (curl, server-to-server)", async () => {
+    expect(await guardRequest(req(), { name: "o", limit: 5 })).toBeNull();
   });
 
-  it("allows localhost origins outside production", () => {
-    expect(guardRequest(req({ origin: "http://localhost:3000" }), { name: "o", limit: 5 })).toBeNull();
+  it("allows localhost origins outside production", async () => {
+    expect(await guardRequest(req({ origin: "http://localhost:3000" }), { name: "o", limit: 5 })).toBeNull();
   });
 
   it("rejects a foreign browser origin with 403", async () => {
-    const res = guardRequest(req({ origin: "https://evil.example" }), { name: "o", limit: 5 });
+    const res = await guardRequest(req({ origin: "https://evil.example" }), { name: "o", limit: 5 });
     expect(res?.status).toBe(403);
     expect((await res!.json()).code).toBe("forbidden");
+  });
+});
+
+describe("guardUser / guardDailyBudget", () => {
+  it("limits per user id regardless of IP", async () => {
+    expect(await guardUser("u1", { name: "chat", limit: 2 })).toBeNull();
+    expect(await guardUser("u1", { name: "chat", limit: 2 })).toBeNull();
+    const blocked = await guardUser("u1", { name: "chat", limit: 2 });
+    expect(blocked?.status).toBe(429);
+    expect(await guardUser("u2", { name: "chat", limit: 2 })).toBeNull();
+  });
+
+  it("daily budget is tracked separately from the per-minute limit", async () => {
+    expect(await guardDailyBudget("u1", "chat", 1)).toBeNull();
+    expect((await guardDailyBudget("u1", "chat", 1))?.status).toBe(429);
+    // the per-minute bucket for the same user is untouched
+    expect(await guardUser("u1", { name: "chat", limit: 5 })).toBeNull();
   });
 });

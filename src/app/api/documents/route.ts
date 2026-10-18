@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { requireUser } from "@/lib/auth";
 import { guardRequest } from "@/lib/apiGuard";
+import { bumpUserCacheVersion } from "@/lib/cache";
 import { apiError } from "@/lib/api/http";
 
 function mapRow(row: Record<string, unknown>) {
@@ -55,11 +56,11 @@ export async function GET(req: Request) {
 /** Delete ALL of the caller's documents (RLS scopes it to their own; chunks cascade via FK). */
 export async function DELETE(req: Request) {
   // Wipes everything — the most destructive call in the API.
-  const blocked = guardRequest(req, { name: "documents-delete-all", limit: 5 });
+  const blocked = await guardRequest(req, { name: "documents-delete-all", limit: 5 });
   if (blocked) return blocked;
   const auth = await requireUser(req);
   if (!auth.ok) return auth.response;
-  const { supabase } = auth;
+  const { supabase, user } = auth;
   try {
     const { error } = await supabase
       .from("documents")
@@ -71,6 +72,7 @@ export async function DELETE(req: Request) {
       throw new Error(error.message);
     }
 
+    await bumpUserCacheVersion(user.id);
     return NextResponse.json({ ok: true });
   } catch (error: unknown) {
     console.error("[API /documents ERROR]:", error);

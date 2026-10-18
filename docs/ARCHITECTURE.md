@@ -19,6 +19,7 @@ flowchart LR
   R -->|2 requireUser| A[(Supabase Auth)]
   R -->|3 parseBody + zod| R
   R -->|user JWT, RLS applies| DB[(Postgres + pgvector<br/>HNSW + GIN indexes)]
+  R -->|rate limits + caches| RD[(Upstash Redis<br/>optional)]
   R --> LLM[Groq / Gemini<br/>fallback chain]
   R -.->|optional| LF[Langfuse tracing]
 ```
@@ -29,10 +30,11 @@ Request path through a data route, in order — each layer rejects early and che
 |---|---|---|---|
 | 1 | Same-origin check + per-IP rate limit | 403 / 429 | `src/lib/apiGuard.ts` |
 | 2 | Authentication (cookie session or Bearer) | 401 | `src/lib/auth.ts` |
-| 3 | Body size cap, JSON parse, schema validation | 413 / 400 | `src/lib/api/http.ts`, `schemas.ts` |
-| 4 | Row Level Security in the database | empty result / RLS error | `supabase/migrations/005_auth_tenancy.sql` |
+| 3 | Per-user rate limit + daily budget | 429 | `src/lib/apiGuard.ts` (`guardUser`, `guardDailyBudget`) |
+| 4 | Body size cap, JSON parse, schema validation | 413 / 400 | `src/lib/api/http.ts`, `schemas.ts` |
+| 5 | Row Level Security in the database | empty result / RLS error | `supabase/migrations/005_auth_tenancy.sql` |
 
-Layer 4 is the one that matters most: even if layers 2–3 had a bug, a user's queries physically
+Layer 5 is the one that matters most: even if layers 2–4 had a bug, a user's queries physically
 cannot return another user's rows.
 
 Contracts: every route's request schema lives in `src/lib/api/schemas.ts`; every error response is
@@ -45,7 +47,7 @@ Contracts: every route's request schema lives in `src/lib/api/schemas.ts`; every
 | 0 | Contracts, size caps, error format, test runner, CI | ✅ |
 | 1 | Auth (Supabase), tenancy, RLS | 🧪 code done; needs migration 005 + dashboard steps |
 | 2 | HNSW index, indexed hybrid search, migrations | 🧪 code done; needs migration 006 |
-| 3 | Redis rate limiting + caching | 📋 |
+| 3 | Redis rate limiting + caching | 🧪 code done; works without Redis, needs Upstash credentials to take effect |
 | 4 | Background ingestion | 📋 |
 | 5 | Connection security (headers, CSP, CORS, cookie flags) | 📋 |
 | 6 | Observability (structured logs, Sentry, health) | 📋 |
@@ -173,6 +175,72 @@ Contracts: every route's request schema lives in `src/lib/api/schemas.ts`; every
   re-runnable files are the minimum for repeatable environments; adopting the CLI is a Stage 7 task.
 - **Override:** _______________________
 
+## 5b. Decisions — Stage 3: rate limiting & caching
+
+### D3.1 Redis provider and client
+- **Options:** Upstash Redis (REST) · Vercel KV · self-hosted Redis · Postgres table
+- **Chosen:** Upstash Redis via `@upstash/redis` (REST over HTTPS)
+- **Why:** serverless functions can't hold a pooled TCP connection, and Upstash's REST API is stateless HTTP,
+  so there's no connection management and a generous free tier. Vercel KV is Upstash underneath. A Postgres
+  counter table would work but adds write load to the primary database on every request.
+- **Override:** _______________________
+
+### D3.2 Rate-limit algorithm and layers
+- **Options:** fixed window · sliding window · token bucket; IP only vs IP + user
+- **Chosen:** sliding window (`@upstash/ratelimit`, atomic Lua script), at **two layers** — per IP before
+  auth, per user after auth — plus a **per-user daily budget** on `chat` (default 300, `DAILY_CHAT_LIMIT`)
+  and `ingest` (100).
+- **Why:** a fixed window lets a client burst 2× the limit at a window boundary; sliding doesn't. IP-only
+  limits fail both ways (rotating IPs evades them; a shared office IP punishes innocent users), so the user
+  layer is the real control. The daily budget protects the shared free-tier LLM quota, which is the actual
+  scarce resource.
+- **Interview answer:** "Limits are enforced at the edge by IP and again per authenticated user, with a daily
+  cost budget — because request rate and spend are different problems."
+- **Override:** _______________________
+
+### D3.3 Failure behaviour (fail open vs closed)
+- **Chosen:** Redis errors **or slowness (>1.5 s)** → the rate limiter falls back to the in-memory limiter;
+  the cache treats it as a miss. Never "allow everything", never "fail the request".
+- **Why:** `@upstash/ratelimit` by default *allows* the request after a 5 s timeout, which would silently
+  turn limiting off whenever Redis is slow — so its timeout is disabled and ours falls back to the
+  in-memory limiter (a weaker but still real limit). A cache outage should cost latency, not correctness.
+- **Verified by tests:** erroring Redis, hung Redis, and no Redis at all.
+- **Override:** _______________________
+
+### D3.4 What is cached, and what deliberately is not
+| Cached | Key | TTL | Why |
+|---|---|---|---|
+| Query embedding | `emb:v1:<model>:<dims>:<sha256(text)>` | 7 d | Gemini embedding is capped at 100/min on the free tier; same question repeats. Pure function of text, so shared across users. |
+| Full retrieval response (incl. rewrite + rerank) | `ret:v1:<user>:<generation>:<sha256(request)>` | 5 min | A hit skips embedding, DB search **and** the LLM rerank/rewrite tokens. Per-user key — results are tenant data. |
+
+Not cached: **chat answers** (LLM output; belongs with the later LLM-governance work), **document lists**
+(they carry every document's full text — too large for Redis REST payloads; fix is pagination), and
+**ingest-time chunk embeddings** (unique text, no reuse).
+- **Guards:** a response built from the *mock embedding fallback* is never cached (it would stay near-random
+  for the whole TTL after Gemini recovers). The embedding key includes the model + dimensions, so changing
+  the model can't reuse stale vectors. `Cache-Control: no-cache` bypasses reads (the eval harness sends it,
+  so evals measure the real pipeline). Responses carry `X-Cache: HIT | MISS | BYPASS`.
+- **Known gap:** if rewrite/rerank fail open to a degraded result, that degraded result is cached for ≤5 min.
+- **Override:** _______________________
+
+### D3.5 Invalidation
+- **Options:** TTL only · delete matching keys on write · version number in the key
+- **Chosen:** per-user **generation counter** (`ver:<user>`) embedded in every retrieval key; ingest and both
+  delete routes `INCR` it.
+- **Why:** TTL-only would hide a just-uploaded document for up to 5 minutes. Deleting keys needs `SCAN`,
+  which is slow and racy. A version bump invalidates all of a user's entries in one O(1) write; old keys just
+  expire. Cost: one extra Redis read per retrieve.
+- **Interview answer:** "Cache invalidation by key versioning: writes bump a counter, so stale entries become
+  unreachable instead of having to be found and deleted."
+- **Override:** _______________________
+
+### D3.6 No in-memory cache fallback
+- **Chosen:** without Redis the cache is a no-op.
+- **Why:** each serverless instance would hold its own copy and the version bump can't reach the others, so
+  an upload on one instance would leave stale results on another. Wrong answers are worse than slow ones.
+  (Rate limiting *can* fall back to memory because the worst case is a looser limit, not wrong data.)
+- **Override:** _______________________
+
 ## 6. Known limitations (be honest about these)
 
 - **HNSW + tenant filter can under-return.** pgvector applies the `user_id` filter *after* the index
@@ -180,7 +248,7 @@ Contracts: every route's request schema lives in `src/lib/api/schemas.ts`; every
   rows. Fix when it matters: pgvector ≥ 0.8 `SET hnsw.iterative_scan = relaxed_order` (not hard-coded
   here because it errors on older pgvector), or partition by tenant. Tiny tenants are safe — the planner
   switches to a btree plan (tested with a 1-chunk user next to a 20,000-chunk user).
-- **Rate limiter is still in-memory** (per serverless instance). Replaced in Stage 3.
+- **Without Upstash credentials the rate limiter is in-memory** (per serverless instance, resets on cold start) and nothing is cached. Set `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` to get the shared limits and caches. The Redis path is covered by mocked tests only — it has not been run against a real Upstash database yet.
 - **Embedding fallback is silent** — a Gemini embedding outage degrades retrieval to near-random while
   returning 200. Made loud in Stage 6.
 - **`GET /api/documents` returns every document's full text.** Pagination belongs with the Stage 7 UI split.
@@ -204,6 +272,9 @@ Do these in order. Applying the code before the SQL will break ingest and search
    `npm run eval`, also set `EVAL_EMAIL` / `EVAL_PASSWORD` for an account that owns the documents the
    golden dataset asks about.
 7. Re-run `npm run eval -- --mode both` and compare with the pre-change results in `evals/results/`.
+8. **Optional (Stage 3):** create a free Upstash Redis database, copy its REST URL and token into
+   `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` (local `.env.local` and Vercel). No SQL needed.
+   Verify with two identical retrieve calls: the second should return `X-Cache: HIT`.
 
 To re-verify the SQL yourself on a scratch database: `supabase/tests/local_stubs.sql` then
 `supabase/tests/rls_isolation.sql` (needs local Postgres + pgvector).

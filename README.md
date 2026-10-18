@@ -192,6 +192,8 @@ NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key
 ```
 
+Optional: add `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` (free [Upstash](https://console.upstash.com) Redis) for shared rate limiting and caching; without them the app uses an in-memory limiter and no cache.
+
 `SUPABASE_SERVICE_ROLE_KEY` is only needed for the admin script `npm run reembed`; the app itself runs as the signed-in user under Row Level Security.
 
 Get your keys:

@@ -8,7 +8,7 @@ function getApiKey(): string {
   return key.trim();
 }
 
-const EMBEDDING_MODEL = "gemini-embedding-001";
+export const EMBEDDING_MODEL = "gemini-embedding-001";
 export const EMBEDDING_DIMS = 768;
 
 // gemini-2.0-flash has zero free-tier generateContent quota (July 2026);

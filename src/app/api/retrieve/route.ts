@@ -1,22 +1,31 @@
 import { NextResponse } from "next/server";
 import { hybridSearchDb, vectorSearch } from "@/lib/search";
 import { vectorDocsToRetrievalResults } from "@/lib/vectorDocsToRetrieval";
-import { embedTexts } from "@/lib/gemini";
+import { embedQueryCached } from "@/lib/embedCache";
+import { cacheGet, cacheSet, getUserCacheVersion } from "@/lib/cache";
+import {
+  RETRIEVAL_TTL_SECONDS,
+  retrievalCacheKey,
+  wantsFreshResults,
+  type CachedRetrieval,
+} from "@/lib/retrievalCache";
 import { mockEmbeddingsForTexts } from "@/lib/embedFallback";
 import { requireUser } from "@/lib/auth";
 import { startTrace, flushTraces } from "@/lib/observability";
 import { rewriteQuery } from "@/lib/queryRewrite";
 import { rerankDocs, rerankCandidateCount } from "@/lib/rerank";
-import { guardRequest } from "@/lib/apiGuard";
+import { guardRequest, guardUser } from "@/lib/apiGuard";
 import { apiError, parseBody } from "@/lib/api/http";
 import { retrieveSchema } from "@/lib/api/schemas";
 
 export async function POST(req: Request) {
-  const blocked = guardRequest(req, { name: "retrieve", limit: 30 });
+  const blocked = await guardRequest(req, { name: "retrieve", limit: 30 });
   if (blocked) return blocked;
   const auth = await requireUser(req);
   if (!auth.ok) return auth.response;
-  const { supabase } = auth;
+  const { supabase, user } = auth;
+  const perUser = await guardUser(user.id, { name: "retrieve", limit: 30 });
+  if (perUser) return perUser;
 
   const parsed = await parseBody(req, retrieveSchema);
   if (!parsed.ok) return parsed.response;
@@ -26,6 +35,21 @@ export async function POST(req: Request) {
   const useRerank = parsed.data.rerank ?? false;
   const useRewrite = parsed.data.rewrite ?? false;
   const filterDocumentId = parsed.data.filterDocumentId ?? null;
+
+  // Cache lookup comes before tracing/embedding/LLM work: a hit costs two Redis reads.
+  const fresh = wantsFreshResults(req);
+  const cacheKey = retrievalCacheKey(user.id, await getUserCacheVersion(user.id), {
+    query,
+    topK,
+    useHybrid,
+    rerank: useRerank,
+    rewrite: useRewrite,
+    filterDocumentId,
+  });
+  if (!fresh) {
+    const hit = await cacheGet<CachedRetrieval>(cacheKey);
+    if (hit) return NextResponse.json(hit, { headers: { "X-Cache": "HIT" } });
+  }
 
   const trace = startTrace("retrieve", {
     input: { query, topK, useHybrid, rerank: useRerank, rewrite: useRewrite, filterDocumentId },
@@ -45,17 +69,19 @@ export async function POST(req: Request) {
     }
 
     const embedSpan = trace?.span({ name: "embed-query", input: { query: searchQuery } });
-    let embeddings: number[][];
+    let queryEmbedding: number[] | undefined;
     let embeddingSource = "gemini/gemini-embedding-001";
+    let embeddingCached = false;
     try {
-      embeddings = await embedTexts([searchQuery]);
+      const r = await embedQueryCached(searchQuery);
+      queryEmbedding = r.embedding;
+      embeddingCached = r.cached;
     } catch {
-      embeddings = mockEmbeddingsForTexts([searchQuery]);
+      [queryEmbedding] = mockEmbeddingsForTexts([searchQuery]);
       embeddingSource = "mock-fallback";
     }
-    embedSpan?.end({ output: { embeddingSource, dims: embeddings[0]?.length ?? 0 } });
+    embedSpan?.end({ output: { embeddingSource, embeddingCached, dims: queryEmbedding?.length ?? 0 } });
 
-    const [queryEmbedding] = embeddings;
     if (!queryEmbedding?.length) {
       trace?.update({ output: { error: "Failed to build query embedding" } });
       await flushTraces();
@@ -99,10 +125,16 @@ export async function POST(req: Request) {
       },
     });
     await flushTraces();
-    return NextResponse.json({
+    const payload: CachedRetrieval = {
       results,
       ...(useRewrite && searchQuery !== query ? { rewrittenQuery: searchQuery } : {}),
-    });
+    };
+    // Never cache a response built from the mock-embedding fallback: it is near-random and
+    // would stay wrong for the whole TTL after Gemini recovers.
+    if (embeddingSource !== "mock-fallback") {
+      await cacheSet(cacheKey, payload, RETRIEVAL_TTL_SECONDS);
+    }
+    return NextResponse.json(payload, { headers: { "X-Cache": fresh ? "BYPASS" : "MISS" } });
   } catch (e) {
     console.error("[api/retrieve]", e);
     trace?.update({ output: { error: e instanceof Error ? e.message : String(e) } });

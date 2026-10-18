@@ -2,12 +2,18 @@ import { NextResponse } from "next/server";
 import { generateText as generateGroq, openGroqChatTextStream, groqModelName } from "@/lib/groq";
 import { generateText as generateGemini, openGeminiChatTextStream, GEMINI_TEXT_MODEL } from "@/lib/gemini";
 import { startTrace, flushTraces, tapTextStream } from "@/lib/observability";
-import { guardRequest } from "@/lib/apiGuard";
+import { guardDailyBudget, guardRequest, guardUser } from "@/lib/apiGuard";
 import { requireUser } from "@/lib/auth";
 import { apiError, parseBody } from "@/lib/api/http";
 import { chatSchema } from "@/lib/api/schemas";
 
 const GROQ_MODEL = groqModelName();
+
+/** Per-user daily cap on LLM generations; env-tunable. */
+function dailyLimit(envName: string, fallback: number): number {
+  const n = Number(process.env[envName]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 const GEMINI_MODEL = GEMINI_TEXT_MODEL;
 
 function parseSummaryFromModel(raw: string): {
@@ -71,11 +77,15 @@ const streamHeaders = {
  */
 export async function POST(req: Request) {
   // LLM generation is the most expensive call — cap it tightest.
-  const blocked = guardRequest(req, { name: "chat", limit: 20 });
+  const blocked = await guardRequest(req, { name: "chat", limit: 20 });
   if (blocked) return blocked;
   // Burns LLM / embedding quota — signed-in users only.
   const auth = await requireUser(req);
   if (!auth.ok) return auth.response;
+  const perUser =
+    (await guardUser(auth.user.id, { name: "chat", limit: 20 })) ??
+    (await guardDailyBudget(auth.user.id, "chat", dailyLimit("DAILY_CHAT_LIMIT", 300)));
+  if (perUser) return perUser;
   const parsed = await parseBody(req, chatSchema);
   if (!parsed.ok) return parsed.response;
   const { prompt } = parsed.data;

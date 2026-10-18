@@ -1,22 +1,24 @@
 import "server-only";
 import type { NextResponse } from "next/server";
 import { apiError } from "@/lib/api/http";
+import { __resetRateLimitForTests, rateLimit } from "@/lib/rateLimit";
 
 /**
- * Lightweight abuse guard for public API routes. Two independent layers:
+ * Abuse guard for the API routes, in two stages around authentication:
  *
- *  1. Same-origin check — rejects browser requests coming from a page NOT served
- *     by this deployment (classic CSRF-style Origin/Referer allowlist). This stops
- *     someone calling your endpoints from another site's page or console.
- *  2. Per-IP rate limit — a best-effort in-memory fixed window. It caps how fast a
- *     single IP can hit an endpoint, blunting scripted floods that would burn LLM /
- *     embedding quota or spam the database.
+ *  guardRequest (before auth)
+ *    1. Same-origin check — rejects browser requests coming from a page NOT served by this
+ *       deployment (Origin/Referer allowlist), so another site can't drive your endpoints.
+ *    2. Per-IP rate limit.
+ *  guardUser / guardDailyBudget (after auth)
+ *    3. Per-user rate limit and daily budget, so rotating IPs doesn't evade the limits.
+ *
+ * Limiter backend (src/lib/rateLimit.ts): Upstash Redis sliding window when
+ * UPSTASH_REDIS_REST_URL/TOKEN are set (shared across all serverless instances — a real limit);
+ * otherwise an in-memory window that is per warm instance and resets on cold start.
  *
  * LIMITATIONS (be honest in an interview):
- *  - The rate limiter is in-memory, so it is PER serverless instance and resets on
- *    cold start. It slows abuse; it is not a hard global quota. For strict limits,
- *    back it with Upstash Redis (`@upstash/ratelimit`) and swap `hit()` for a Redis
- *    call — the call sites below don't change.
+ *  - Without Redis configured the limit is only best-effort per instance.
  *  - The origin check only constrains browsers (curl/servers send no Origin). That's
  *    fine: cross-site browser abuse is what it targets; floods are the rate limiter's job.
  *
@@ -69,36 +71,12 @@ function checkOrigin(req: Request): NextResponse | null {
   return apiError(403, "forbidden", "Forbidden: cross-origin request");
 }
 
-// --- Best-effort in-memory rate limiter (per warm instance) ---------------------
-
-type Bucket = { count: number; resetAt: number };
-const buckets = new Map<string, Bucket>();
+// --- Rate limiting is delegated to src/lib/rateLimit.ts (Redis when configured, else memory) ---
 
 function clientIp(req: Request): string {
   const fwd = req.headers.get("x-forwarded-for");
   if (fwd) return fwd.split(",")[0]!.trim();
   return req.headers.get("x-real-ip")?.trim() || "unknown";
-}
-
-/** Records a hit; returns { ok, retryAfter } where retryAfter is seconds until reset. */
-function hit(bucketKey: string, limit: number, windowMs: number): { ok: boolean; retryAfter: number } {
-  const now = Date.now();
-  const existing = buckets.get(bucketKey);
-  if (!existing || existing.resetAt <= now) {
-    buckets.set(bucketKey, { count: 1, resetAt: now + windowMs });
-    return { ok: true, retryAfter: 0 };
-  }
-  existing.count += 1;
-  if (existing.count > limit) {
-    return { ok: false, retryAfter: Math.ceil((existing.resetAt - now) / 1000) };
-  }
-  return { ok: true, retryAfter: 0 };
-}
-
-// Opportunistic cleanup so the Map can't grow unbounded on a long-lived instance.
-function sweep(now: number): void {
-  if (buckets.size < 5000) return;
-  for (const [k, v] of buckets) if (v.resetAt <= now) buckets.delete(k);
 }
 
 export type GuardOptions = {
@@ -111,31 +89,51 @@ export type GuardOptions = {
 };
 
 /**
- * Run both guards. Returns a blocking NextResponse (403 or 429) to return from the
- * route handler, or null when the request may proceed.
+ * Layer 1 (before authentication): same-origin check + per-IP rate limit. Returns a blocking
+ * NextResponse (403 or 429) to return from the route handler, or null when the request may proceed.
  *
- *   const blocked = guardRequest(req, { name: "chat", limit: 20 });
+ *   const blocked = await guardRequest(req, { name: "chat", limit: 20 });
  *   if (blocked) return blocked;
  */
-export function guardRequest(req: Request, opts: GuardOptions): NextResponse | null {
+export async function guardRequest(req: Request, opts: GuardOptions): Promise<NextResponse | null> {
   const origin = checkOrigin(req);
   if (origin) return origin;
 
-  const limit = opts.limit ?? 30;
-  const windowMs = opts.windowMs ?? 60_000;
-  const now = Date.now();
-  sweep(now);
-
-  const { ok, retryAfter } = hit(`${opts.name}:${clientIp(req)}`, limit, windowMs);
-  if (!ok) {
-    const res = apiError(429, "rate_limited", "Too many requests. Please slow down.", { retryAfter });
-    res.headers.set("Retry-After", String(retryAfter));
-    return res;
-  }
-  return null;
+  const { ok, retryAfter } = await rateLimit(
+    `ip:${opts.name}:${clientIp(req)}`,
+    opts.limit ?? 30,
+    opts.windowMs ?? 60_000
+  );
+  return ok ? null : tooMany(retryAfter);
 }
 
-/** Test hook: clears all rate-limit buckets. */
+/**
+ * Layer 2 (after authentication): per-USER limit. The IP limit alone is not enough — one user can
+ * rotate IPs, and one IP (an office, a university) can hold many legitimate users.
+ */
+export async function guardUser(userId: string, opts: GuardOptions): Promise<NextResponse | null> {
+  const { ok, retryAfter } = await rateLimit(
+    `user:${opts.name}:${userId}`,
+    opts.limit ?? 30,
+    opts.windowMs ?? 60_000
+  );
+  return ok ? null : tooMany(retryAfter);
+}
+
+const DAY_MS = 24 * 3600 * 1000;
+
+/** Per-user daily budget for an expensive action (protects shared free-tier LLM quota). */
+export function guardDailyBudget(userId: string, name: string, perDay: number): Promise<NextResponse | null> {
+  return guardUser(userId, { name: `${name}-daily`, limit: perDay, windowMs: DAY_MS });
+}
+
+function tooMany(retryAfter: number): NextResponse {
+  const res = apiError(429, "rate_limited", "Too many requests. Please slow down.", { retryAfter });
+  res.headers.set("Retry-After", String(retryAfter));
+  return res;
+}
+
+/** Test hook: clears all rate-limit state. */
 export function __resetGuardForTests(): void {
-  buckets.clear();
+  __resetRateLimitForTests();
 }
