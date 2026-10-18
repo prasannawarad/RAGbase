@@ -10,18 +10,23 @@
     "start": "next start",
     "lint": "next lint",
     "eval": "tsx scripts/eval.ts",
-    "reembed": "tsx scripts/reembed.ts"
+    "reembed": "tsx scripts/reembed.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
+    "@supabase/ssr": "^0.12.7",
     "@supabase/supabase-js": "^2.103.0",
     "groq-sdk": "^1.1.2",
     "langfuse": "^3.38.20",
-    "next": "^15.5.0",
+    "next": "^15.5.28",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-is": "^19.0.0",
     "recharts": "^2.15.0",
-    "server-only": "^0.0.1"
+    "server-only": "^0.0.1",
+    "zod": "^3.25.76"
   },
   "overrides": {
     "react-is": "^19.0.0"
@@ -32,10 +37,11 @@
     "@types/react-dom": "^19",
     "autoprefixer": "^10.4.20",
     "eslint": "^9",
-    "eslint-config-next": "^15.5.0",
+    "eslint-config-next": "^15.5.28",
     "postcss": "^8",
     "tailwindcss": "^3.4.17",
     "tsx": "^4.22.4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.12"
   }
 }
