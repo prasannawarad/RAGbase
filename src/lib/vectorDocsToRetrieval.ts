@@ -1,11 +1,14 @@
 import "server-only";
 
 import type { VectorDoc } from "@/lib/vectorStore";
-import { getSupabaseAdmin } from "@/lib/supabase/server";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { makeContentSnippet, type RetrievalResult } from "@/lib/retrievalResult";
 
 /** Server-only: map vector search rows to attributed retrieval results; fills document names from DB when missing in chunk metadata. */
-export async function vectorDocsToRetrievalResults(docs: VectorDoc[]): Promise<RetrievalResult[]> {
+export async function vectorDocsToRetrievalResults(
+  supabase: SupabaseClient,
+  docs: VectorDoc[]
+): Promise<RetrievalResult[]> {
   const docIds = [
     ...new Set(
       docs.map((d) => d.metadata.docId).filter((id): id is string => typeof id === "string" && id.length > 0)
@@ -15,7 +18,6 @@ export async function vectorDocsToRetrievalResults(docs: VectorDoc[]): Promise<R
   const nameById = new Map<string, string>();
   if (docIds.length) {
     try {
-      const supabase = getSupabaseAdmin();
       const { data } = await supabase.from("documents").select("id, name").in("id", docIds);
       for (const row of data || []) {
         const id = row.id as string;

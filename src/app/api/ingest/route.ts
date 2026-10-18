@@ -1,71 +1,24 @@
 import { NextResponse } from "next/server";
-import { getSupabaseAdmin, isSupabaseConfigured } from "@/lib/supabase/server";
+import { apiError, devDetails, parseBody } from "@/lib/api/http";
+import { ingestSchema, LIMITS } from "@/lib/api/schemas";
+import { requireUser } from "@/lib/auth";
 import { toVectorParam } from "@/lib/search";
 import { embedTexts } from "@/lib/gemini";
 import { mockEmbeddingsForTexts } from "@/lib/embedFallback";
-
-/**
- * Body (minimum):
- *   { documentName: string, chunks: string[] }
- *
- * Optional (preserves upload metadata / UI):
- *   fileType?: string
- *   pages?: number | null
- */
-type IngestBody = {
-  documentName?: unknown;
-  chunks?: unknown;
-  fileType?: unknown;
-  pages?: unknown;
-};
+import { guardRequest } from "@/lib/apiGuard";
 
 export async function POST(req: Request) {
-  if (!isSupabaseConfigured()) {
-    return NextResponse.json(
-      {
-        error:
-          "Supabase is not configured (set SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL)",
-      },
-      { status: 503 }
-    );
-  }
+  // Writes rows + burns embedding quota — keep it low.
+  const blocked = guardRequest(req, { name: "ingest", limit: 10 });
+  if (blocked) return blocked;
+  const auth = await requireUser(req);
+  if (!auth.ok) return auth.response;
+  const { supabase, user } = auth;
 
-  let body: IngestBody;
-  try {
-    body = (await req.json()) as IngestBody;
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
-  }
-
-  const documentName = typeof body.documentName === "string" ? body.documentName.trim() : "";
-  if (!documentName) {
-    return NextResponse.json(
-      {
-        error:
-          "Expected body: { documentName: string, chunks: string[], fileType?: string, pages?: number | null }",
-      },
-      { status: 400 }
-    );
-  }
-
-  const rawChunks = body.chunks;
-  if (!Array.isArray(rawChunks) || rawChunks.length === 0) {
-    return NextResponse.json({ error: "No chunks provided" }, { status: 400 });
-  }
-
-  const chunks = rawChunks.map((c) => String(c));
-
-  if (chunks.some((t) => !t.trim())) {
-    return NextResponse.json({ error: "chunks must be non-empty strings" }, { status: 400 });
-  }
-
-  const fileType = typeof body.fileType === "string" && body.fileType.trim() ? body.fileType.trim() : "text";
-  const pages =
-    typeof body.pages === "number" && Number.isFinite(body.pages)
-      ? body.pages
-      : body.pages === null
-        ? null
-        : null;
+  const parsed = await parseBody(req, ingestSchema, LIMITS.bodyBytesIngest);
+  if (!parsed.ok) return parsed.response;
+  const { documentName, chunks, pages = null } = parsed.data;
+  const fileType = parsed.data.fileType ?? "text";
 
   let embeddings: number[][];
   try {
@@ -75,11 +28,11 @@ export async function POST(req: Request) {
   }
 
   if (!embeddings || embeddings.length !== chunks.length) {
-    return NextResponse.json({ error: "Embedding mismatch" }, { status: 500 });
+    return apiError(500, "internal_error", "Embedding mismatch");
   }
 
   if (embeddings[0]?.length !== 768) {
-    return NextResponse.json({ error: "Invalid embedding dimension" }, { status: 500 });
+    return apiError(500, "internal_error", "Invalid embedding dimension");
   }
 
   const rawText = chunks.join("\n\n");
@@ -91,11 +44,10 @@ export async function POST(req: Request) {
       : 0;
   const uploadedAt = new Date().toISOString();
 
-  const supabase = getSupabaseAdmin();
-
   const { data: insertedDocs, error } = await supabase
     .from("documents")
     .insert({
+      user_id: user.id,
       name: documentName,
       raw_text: rawText,
       char_count: charCount,
@@ -119,27 +71,12 @@ export async function POST(req: Request) {
       hint: error.hint,
     });
 
-    return NextResponse.json(
-      {
-        error: "Failed to insert document",
-        details: error.message,
-        code: error.code,
-        hint: error.hint,
-        supabaseDetails: error.details,
-      },
-      { status: 500 }
-    );
+    return apiError(500, "internal_error", "Failed to insert document", devDetails(error.message));
   }
 
   if (!docRow) {
     console.error("[INGEST ERROR - DOCUMENT INSERT]:", "No row returned");
-    return NextResponse.json(
-      {
-        error: "Failed to insert document",
-        details: "No row returned",
-      },
-      { status: 500 }
-    );
+    return apiError(500, "internal_error", "Failed to insert document");
   }
 
   const docId = docRow.id as string;
@@ -147,6 +84,7 @@ export async function POST(req: Request) {
   const rows = chunks.map((text, i) => {
     const wordCountChunk = text.split(/\s+/).filter(Boolean).length || 0;
     return {
+      user_id: user.id,
       document_id: docId,
       chunk_index: i,
       content: text,
@@ -171,16 +109,7 @@ export async function POST(req: Request) {
 
     await supabase.from("documents").delete().eq("id", docId);
 
-    return NextResponse.json(
-      {
-        error: "Failed to insert chunks",
-        details: chunkError.message,
-        code: chunkError.code,
-        hint: chunkError.hint,
-        supabaseDetails: chunkError.details,
-      },
-      { status: 500 }
-    );
+    return apiError(500, "internal_error", "Failed to insert chunks", devDetails(chunkError.message));
   }
 
   return NextResponse.json({

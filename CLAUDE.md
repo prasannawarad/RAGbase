@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## What this is
+
+RAGBase — a RAG pipeline app: upload documents (text/PDF), chunk and embed them into Supabase pgvector, retrieve via vector or hybrid search (with optional query rewrite and LLM rerank), and chat over the results through a streaming LLM fallback chain. Retrieval quality is measured with an LLM-as-judge eval harness.
+
 ## Commands
 
 ```bash
@@ -10,11 +14,15 @@ npm run dev:turbo    # dev with Turbopack (faster HMR)
 npm run dev:clean    # wipe .next cache then start dev
 npm run build        # production build
 npm run lint         # ESLint
+npm run typecheck    # tsc --noEmit
+npm test             # Vitest unit tests (tests/*.test.ts); no network or DB needed
 npm run eval         # LLM-as-judge eval harness (see evals/README.md; dev server must be running)
 npm run reembed      # re-embed all chunks in Supabase (after embedding model changes)
 ```
 
-No unit test suite exists yet. TypeScript checking runs as part of `next build`. Retrieval/answer quality is measured with `npm run eval` against a golden dataset (`evals/dataset.json`).
+Unit tests (Vitest) cover pure logic and the security seams: schemas, error/body parsing, rate limiter, auth gate, search mappers, chunker, BM25. They do **not** call an LLM or a database. CI (`.github/workflows/ci.yml`) runs lint → typecheck → test → build. Retrieval/answer quality is measured separately with `npm run eval` against a golden dataset (`evals/dataset.json`) — manual, not a CI gate (it spends free-tier tokens). SQL/RLS is tested on a scratch Postgres via `supabase/tests/` (see `docs/ARCHITECTURE.md` §7).
+
+Design decisions and their reasoning live in `docs/ARCHITECTURE.md` — read it before changing auth, RLS, search, or the API contract.
 
 ## Environment Variables
 
@@ -27,11 +35,13 @@ Copy `.env.example` to `.env.local`. Required keys:
 | `GROQ_API_KEY` | Primary LLM (Llama 3.3 70B by default) |
 | `GROQ_MODEL` | Optional override of the Groq model — free-tier token budgets are per-model, so switching models recovers capacity after a daily quota is exhausted |
 | `SUPABASE_URL` | Supabase project URL (server-preferred; falls back to `NEXT_PUBLIC_SUPABASE_URL`) |
-| `SUPABASE_SERVICE_ROLE_KEY` | Bypasses RLS — server/API routes only, never client |
+| `SUPABASE_SERVICE_ROLE_KEY` | Bypasses RLS — admin scripts only (`npm run reembed`). The web app never uses it; there is no service-role client in `src/` |
 | `NEXT_PUBLIC_SUPABASE_URL` | Browser-safe project URL |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Browser-safe anon key (reserved for future client-side use) |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **Required.** Browser-safe anon key; all API data access runs as the logged-in user under RLS |
+| `EVAL_EMAIL` / `EVAL_PASSWORD` | Account `npm run eval` signs in as (must own the eval documents) |
+| `ALLOWED_ORIGINS` | Optional — comma-separated extra origins allowed to call API routes (see API abuse guard). Deployment host + localhost-in-dev are always allowed |
 
-Server-only keys (`GEMINI_API_KEY`, `GROQ_API_KEY`, `SUPABASE_SERVICE_ROLE_KEY`) must never appear in `NEXT_PUBLIC_*` variables or be imported from `"use client"` modules.
+Server-only keys (`GEMINI_API_KEY`, `GROQ_API_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `EVAL_PASSWORD`) must never appear in `NEXT_PUBLIC_*` variables or be imported from `"use client"` modules.
 
 ## Architecture
 
@@ -39,11 +49,11 @@ RAGBase is a Next.js 15 App Router application with a single-page UI backed by A
 
 ### Data flow
 
-**Ingest**: Client sends text chunks → `POST /api/ingest` → embeds via Gemini `gemini-embedding-001` truncated to 768 dims and L2-normalized in `src/lib/gemini.ts` (the model's non-3072 outputs are not unit length; `text-embedding-004` was retired by Google) → inserts into Supabase `documents` + `chunks` tables (pgvector `vector(768)` column). If the embedding model ever changes, run `npm run reembed` — query and chunk vectors must come from the same model.
+**Ingest**: Client sends text chunks → `POST /api/ingest` → embeds via Gemini `gemini-embedding-001` truncated to 768 dims and L2-normalized in `src/lib/gemini.ts` (the model's non-3072 outputs are not unit length; `text-embedding-004` was retired by Google) → inserts into Supabase `documents` + `chunks` tables as the logged-in user (`user_id` set on both; pgvector `vector(768)` column). If the embedding model ever changes, run `npm run reembed` — query and chunk vectors must come from the same model.
 
-**Retrieve**: Client query → `POST /api/retrieve` → embed query → Supabase RPC:
-- Vector-only: `match_chunks` (ANN, L2 distance)
-- Hybrid: `chunk_vector_distances` (full L2 ordering) + in-server BM25 → Reciprocal Rank Fusion (k=60)
+**Retrieve**: Client query → `POST /api/retrieve` → embed query → Supabase RPC (both run in Postgres on indexes and are scoped to the caller by RLS):
+- Vector-only: `match_chunks` (HNSW ANN, L2 distance)
+- Hybrid: `hybrid_search_chunks` — HNSW top-100 ∪ Postgres full-text (GIN) top-100, fused with Reciprocal Rank Fusion (k=60) in SQL. The keyword score is `ts_rank_cd`, returned in the legacy `bm25Score` field (UI contract unchanged)
 - Optional `filterDocumentId` scopes both modes to a single document
 - Optional `rewrite: true` — LLM rewrites the query for retrieval (`src/lib/queryRewrite.ts`); response includes `rewrittenQuery`; the original question is still used for generation and reranking
 - Optional `rerank: true` — first stage fetches `max(topK*4, 20)` candidates, then listwise LLM rerank (`src/lib/rerank.ts`) selects `topK`; both options fail open (fall back to unmodified behavior on any LLM error)
@@ -58,22 +68,29 @@ Provider quota reality (free tiers, July 2026): Groq is ~100–200k tokens/day *
 
 Embedding also falls back: Gemini → `embedFallback.ts` (deterministic mock, same 768 dimensions, L2-normalized). WARNING: this fallback is silent — if Gemini embedding breaks, retrieval degrades to near-random while appearing to work. Check the `embed-query` span in Langfuse (embeddingSource: `mock-fallback`) or compare `/api/embed` output against `mockEmbeddingsForTexts`.
 
+### Request pipeline (every data route)
+
+Order matters — each layer rejects early: `guardRequest` (origin + rate limit) → `requireUser(req)` (`src/lib/auth.ts`) → `parseBody(req, schema)` (`src/lib/api/http.ts`, schemas in `src/lib/api/schemas.ts`) → query via the **user-scoped** client, so Row Level Security applies.
+
+- **Auth**: Supabase Auth. Browser uses cookie sessions (`@supabase/ssr`, refreshed by `src/middleware.ts`, which redirects signed-out page loads to `/login`); CLI tools send `Authorization: Bearer <access_token>`. `/api/*` is never redirected — routes return 401 JSON. Login page has email/password and "Continue as guest" (Supabase anonymous sign-ins).
+- **Tenancy**: `documents.user_id` and `chunks.user_id` + RLS policies (migration 005). Never add a service-role client to request handling — it would bypass isolation.
+- **Contracts**: all errors are `{ error: string, code: string, ... }` via `apiError()`; DB details are only returned outside production.
+- **Abuse guard** (`src/lib/apiGuard.ts`): same-origin check (403 for browser requests from foreign origins; no-Origin curl passes) and a per-IP **in-memory** fixed-window rate limit (`chat` 20/min, `retrieve` 30/min, `embed` 20/min, `ingest` 10/min, `documents` DELETE 20/min, delete-all 5/min). It is per warm serverless instance and resets on cold start. The GET routes (`documents`, `documents/[id]/chunks`) are not rate-limited, only auth-gated.
+
 ### Observability & evals
 
 - `src/lib/observability.ts` — optional Langfuse tracing (no-op without keys). `/api/retrieve` traces embed + search spans; `/api/chat` traces generations, including streamed output via `tapTextStream`. Serverless requires `flushTraces()` before the response finishes.
-- `scripts/eval.ts` (`npm run eval`) — LLM-as-judge harness (Groq Llama 3.3 judge) over the live API. Golden dataset in `evals/dataset.json` (gitignored; example checked in). Supports `--mode vector|hybrid|both` for A/B. Results written to `evals/results/`.
+- `scripts/eval.ts` (`npm run eval`) — LLM-as-judge harness (Groq Llama 3.3 judge) over the live API; signs in with `EVAL_EMAIL`/`EVAL_PASSWORD` and sends a Bearer token. Golden dataset in `evals/dataset.json` (gitignored; example checked in). Supports `--mode vector|hybrid|both` for A/B. Results written to `evals/results/`.
 - `scripts/reembed.ts` (`npm run reembed`) — re-embeds every chunk row; `--dry` to count only. Gemini free tier is 100 embed requests/min; `embedOne` retries on 429.
 
 ### Database schema
 
-Two tables, applied via migrations in `supabase/migrations/` (run in Supabase SQL editor in order):
+Two tables, applied via numbered, idempotent migrations in `supabase/migrations/` (run in the Supabase SQL editor in order; 005 has a manual backfill step — see `docs/ARCHITECTURE.md` §7):
 
-- `documents` — metadata: name, raw_text, char_count, word_count, chunk_count, avg_chunk_size, pages, file_type, status, uploaded_at
-- `chunks` — document_id (FK + cascade delete), chunk_index, content, embedding `vector(768)`, word_count, metadata jsonb
+- `documents` — user_id (owner), name, raw_text, char_count, word_count, chunk_count, avg_chunk_size, pages, file_type, status, uploaded_at
+- `chunks` — user_id, document_id (FK + cascade delete), chunk_index, content, embedding `vector(768)`, word_count, metadata jsonb, `fts` (generated tsvector)
 
-Two Supabase RPC functions:
-- `match_chunks(query_embedding, match_count)` — ANN nearest-neighbor, returns ordered rows with L2 distance
-- `chunk_vector_distances(query_embedding, filter_document_id)` — full distance ordering for all chunks, used by hybrid search
+Indexes (006): HNSW on `embedding` (`vector_l2_ops`), GIN on `fts`, btree on `user_id`/`document_id`. RPCs (`match_chunks`, `hybrid_search_chunks`) are `SECURITY INVOKER` so RLS applies; `anon` has no access to tables or functions. Known limit: HNSW applies the tenant filter after the index scan, so mid-sized tenants can under-return at scale (see ARCHITECTURE §6).
 
 ### Scoring
 
@@ -91,9 +108,12 @@ pdf.js is loaded dynamically from CDN at runtime in the client component (no npm
 
 | File | Use |
 |---|---|
-| `src/lib/supabase/server.ts` | API routes only — singleton service-role client, guarded by `assertNotBrowser()` |
-| `src/lib/supabase/client.ts` | Browser (anon key) — reserved for future client-side Supabase calls |
-| `src/lib/supabase/env.ts` | URL resolution logic shared by both |
+| `src/lib/auth.ts` | `requireUser(req)` — the gate for API routes; returns a user-scoped client (cookie or Bearer) |
+| `src/lib/supabase/request.ts` | Per-request server client built from cookies (server-only) |
+| `src/lib/supabase/client.ts` | Browser client (anon key, cookie session) — used by the login page |
+| `src/lib/supabase/env.ts` | URL / anon-key resolution |
+
+`scripts/reembed.ts` builds its own service-role client (admin job, intentionally bypasses RLS).
 
 ### `next.config.js` notes
 

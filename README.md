@@ -115,7 +115,7 @@ Client → /api/retrieve → embed query (Gemini) → BM25 + vector → RRF → 
 * **Server-side embeddings** — consistency, security, centralized control
 * **Hybrid search (BM25 + vector)** — better recall than pure vector search
 * **Reciprocal Rank Fusion (RRF)** — balances lexical and semantic ranking
-* **Supabase service role (server-only)** — secure ingestion, RPC-based retrieval
+* **Supabase Auth + Row Level Security** — per-user data isolation; ingestion and RPC-based retrieval run as the signed-in user
 
 ---
 
@@ -130,6 +130,8 @@ src/
 │   │   ├── retrieve/
 │   │   ├── documents/
 │   │   └── embed/
+│   ├── login/          ← email/password + guest sign-in
+│   ├── auth/           ← email-confirm callback, sign-out
 │   ├── layout.tsx
 │   └── page.tsx
 ├── components/
@@ -137,21 +139,29 @@ src/
 └── lib/
     ├── gemini.ts       ← embeddings + Gemini text/stream fallback
     ├── groq.ts         ← primary LLM + streaming
-    ├── search.ts       ← hybrid search (BM25 + vector + RRF)
+    ├── search.ts       ← vector + hybrid search via indexed SQL RPCs (RRF)
+    ├── auth.ts         ← requireUser(): cookie or Bearer → user-scoped client
+    ├── apiGuard.ts     ← origin check + rate limit
+    ├── api/            ← zod request schemas, error contract, body parsing
     ├── chunker.ts
     ├── bm25.ts
     ├── tokenizer.ts
     ├── embedFallback.ts
     └── supabase/
         ├── client.ts
-        ├── server.ts
+        ├── request.ts
         └── env.ts
+src/middleware.ts       ← session refresh + login redirect
+tests/                  ← Vitest unit tests
+docs/ARCHITECTURE.md    ← architecture + decision log
 supabase/
 └── migrations/
     ├── 001_ragbase_pgvector.sql
     ├── 002_fix_documents_schema.sql
     ├── 003_documents_full_insert_contract.sql
-    └── 004_grants_postgrest_reload.sql
+    ├── 004_grants_postgrest_reload.sql
+    ├── 005_auth_tenancy.sql
+    └── 006_search_indexes.sql
 ```
 
 ---
@@ -173,14 +183,16 @@ npm install
 
 ### 3. Environment variables
 
-Create `.env.local` with all four keys:
+Create `.env.local` (see `.env.example` for every variable):
 
 ```env
 GEMINI_API_KEY=your_gemini_key
 GROQ_API_KEY=your_groq_key
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key
 ```
+
+`SUPABASE_SERVICE_ROLE_KEY` is only needed for the admin script `npm run reembed`; the app itself runs as the signed-in user under Row Level Security.
 
 Get your keys:
 
@@ -192,12 +204,14 @@ Get your keys:
 
 In the Supabase **SQL Editor**, run the migrations **in order**:
 
-1. `supabase/migrations/001_ragbase_pgvector.sql` — core schema, pgvector, RPCs (`match_chunks`, `chunk_vector_distances`)
+1. `supabase/migrations/001_ragbase_pgvector.sql` — core schema, pgvector, RPCs 
 2. `supabase/migrations/002_fix_documents_schema.sql`
 3. `supabase/migrations/003_documents_full_insert_contract.sql`
-4. `supabase/migrations/004_grants_postgrest_reload.sql` — run last
+4. `supabase/migrations/004_grants_postgrest_reload.sql`
+5. `supabase/migrations/005_auth_tenancy.sql` — per-user ownership + Row Level Security
+6. `supabase/migrations/006_search_indexes.sql` — HNSW + full-text indexes, indexed hybrid search (`match_chunks`, `hybrid_search_chunks`)
 
-Migration 001 enables `vector`, creates `documents` and `chunks` (768-dim), and adds retrieval RPCs. Run all four in sequence.
+Migration 001 enables `vector` and creates `documents` and `chunks` (768-dim). Run all six in sequence. Then enable **Authentication → Allow anonymous sign-ins** if you want the "Continue as guest" button. Existing data needs a one-time backfill — see `docs/ARCHITECTURE.md` §7. Design decisions are logged in `docs/ARCHITECTURE.md`.
 
 ### 5. Run locally
 

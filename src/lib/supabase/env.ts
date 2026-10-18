@@ -10,6 +10,11 @@ export function getSupabaseProjectUrl(): string | undefined {
   return process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
 }
 
-export function isSupabaseServerConfigured(): boolean {
-  return Boolean(getSupabaseProjectUrl() && process.env.SUPABASE_SERVICE_ROLE_KEY?.trim());
+export function getSupabaseAnonKey(): string | undefined {
+  return process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim() || undefined;
+}
+
+/** True when API routes can build a user-scoped (anon key + session cookie) client. */
+export function isSupabaseAuthConfigured(): boolean {
+  return Boolean(getSupabaseProjectUrl() && getSupabaseAnonKey());
 }

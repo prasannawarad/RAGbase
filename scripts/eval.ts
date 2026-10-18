@@ -41,6 +41,32 @@ function arg(name: string, fallback: string): string {
 }
 
 const BASE = arg("base", "http://localhost:3000");
+
+// The API requires a signed-in user. The harness signs in as a dedicated eval account
+// (EVAL_EMAIL / EVAL_PASSWORD in .env.local) and sends its access token as a Bearer header.
+// That account must own the documents the golden dataset asks about (ingest them while
+// logged in as that user).
+let authHeaders: Record<string, string> = {};
+
+async function signIn(): Promise<void> {
+  const url = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "").trim();
+  const anon = (process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "").trim();
+  const email = process.env.EVAL_EMAIL?.trim();
+  const password = process.env.EVAL_PASSWORD;
+  if (!url || !anon || !email || !password) {
+    throw new Error("Set SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, EVAL_EMAIL and EVAL_PASSWORD in .env.local");
+  }
+  const res = await fetch(`${url}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: { apikey: anon, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  const body = (await res.json()) as { access_token?: string; error_description?: string; msg?: string };
+  if (!res.ok || !body.access_token) {
+    throw new Error(`Eval sign-in failed: ${body.error_description || body.msg || res.status}`);
+  }
+  authHeaders = { Authorization: `Bearer ${body.access_token}` };
+}
 const DATASET = arg("dataset", "evals/dataset.json");
 const TOP_K = Number(arg("topk", "5"));
 const JUDGE_MODEL = process.env.EVAL_JUDGE_MODEL?.trim() || "llama-3.3-70b-versatile";
@@ -114,7 +140,7 @@ async function retrieve(
   const t0 = Date.now();
   const res = await fetch(`${BASE}/api/retrieve`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders },
     body: JSON.stringify({
       query: item.question,
       topK: TOP_K,
@@ -168,7 +194,7 @@ async function chat(prompt: string): Promise<{ answer: string; ms: number }> {
   const t0 = Date.now();
   const res = await fetch(`${BASE}/api/chat`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders },
     body: JSON.stringify({ prompt }),
   });
   if (!res.ok) throw new Error(`chat ${res.status}: ${await res.text()}`);
@@ -381,6 +407,7 @@ async function main() {
   }
   const dataset = JSON.parse(fs.readFileSync(datasetPath, "utf8")) as { items: DatasetItem[] };
   const configs = parseConfigs();
+  await signIn();
   console.log(
     `Evaluating ${dataset.items.length} items against ${BASE} (configs: ${configs.map((c) => c.label).join(", ")}, topK: ${TOP_K})\n`
   );

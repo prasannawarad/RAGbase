@@ -490,6 +490,11 @@ export default function RAGBase() {
       setDbLoading(true);
       setDocsLoading(true);
       const res = await fetch("/api/documents");
+      if (res.status === 401) {
+        // Session expired mid-use — middleware will send us to the login page.
+        window.location.href = "/login";
+        return;
+      }
       if (!res.ok) {
         const { parsed: errBody } = await readJsonOnce<{ error?: string }>(res);
         const msg = errBody?.error || `Failed to load documents (${res.status})`;
@@ -1187,6 +1192,11 @@ ${doc.text.substring(0, 3000)}`
             {dbLoading ? "loading…" : dbSynced ? "Supabase synced" : "not persisted"}
           </span>
         </div>
+        <form action="/auth/signout" method="post" style={{ marginTop: 8 }}>
+          <button type="submit" className="hov" style={{ ...S.btnDanger, padding: "5px 10px", fontSize: 10 }}>
+            Sign out
+          </button>
+        </form>
       </div>
 
       <div style={S.sidebarNav} className="flex-1 min-h-0 overflow-y-auto transition-all duration-200">

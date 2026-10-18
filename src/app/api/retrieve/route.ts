@@ -1,51 +1,31 @@
 import { NextResponse } from "next/server";
-import {
-  hybridSearchDb,
-  vectorSearch,
-  vectorSearchFiltered,
-} from "@/lib/search";
+import { hybridSearchDb, vectorSearch } from "@/lib/search";
 import { vectorDocsToRetrievalResults } from "@/lib/vectorDocsToRetrieval";
 import { embedTexts } from "@/lib/gemini";
 import { mockEmbeddingsForTexts } from "@/lib/embedFallback";
-import { isSupabaseConfigured } from "@/lib/supabase/server";
+import { requireUser } from "@/lib/auth";
 import { startTrace, flushTraces } from "@/lib/observability";
 import { rewriteQuery } from "@/lib/queryRewrite";
 import { rerankDocs, rerankCandidateCount } from "@/lib/rerank";
+import { guardRequest } from "@/lib/apiGuard";
+import { apiError, parseBody } from "@/lib/api/http";
+import { retrieveSchema } from "@/lib/api/schemas";
 
 export async function POST(req: Request) {
-  if (!isSupabaseConfigured()) {
-    return NextResponse.json(
-      {
-        error:
-          "Supabase is not configured (set SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL)",
-      },
-      { status: 503 }
-    );
-  }
+  const blocked = guardRequest(req, { name: "retrieve", limit: 30 });
+  if (blocked) return blocked;
+  const auth = await requireUser(req);
+  if (!auth.ok) return auth.response;
+  const { supabase } = auth;
 
-  let body: Record<string, unknown>;
-  try {
-    body = (await req.json()) as Record<string, unknown>;
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
-  }
-
-  const query = typeof body.query === "string" ? body.query.trim() : "";
-  const topK = typeof body.topK === "number" && body.topK > 0 ? body.topK : 5;
-  const useHybrid = Boolean(body.useHybrid);
-  const useRerank = Boolean(body.rerank);
-  const useRewrite = Boolean(body.rewrite);
-  const filterDocumentId =
-    typeof body.filterDocumentId === "string" && body.filterDocumentId.length > 0
-      ? body.filterDocumentId
-      : null;
-
-  if (!query) {
-    return NextResponse.json(
-      { error: "Expected body: { query: string, topK?: number, useHybrid?: boolean, rerank?: boolean, rewrite?: boolean, filterDocumentId?: string }" },
-      { status: 400 }
-    );
-  }
+  const parsed = await parseBody(req, retrieveSchema);
+  if (!parsed.ok) return parsed.response;
+  const { query } = parsed.data;
+  const topK = parsed.data.topK ?? 5;
+  const useHybrid = parsed.data.useHybrid ?? false;
+  const useRerank = parsed.data.rerank ?? false;
+  const useRewrite = parsed.data.rewrite ?? false;
+  const filterDocumentId = parsed.data.filterDocumentId ?? null;
 
   const trace = startTrace("retrieve", {
     input: { query, topK, useHybrid, rerank: useRerank, rewrite: useRewrite, filterDocumentId },
@@ -79,7 +59,7 @@ export async function POST(req: Request) {
     if (!queryEmbedding?.length) {
       trace?.update({ output: { error: "Failed to build query embedding" } });
       await flushTraces();
-      return NextResponse.json({ error: "Failed to build query embedding" }, { status: 500 });
+      return apiError(500, "internal_error", "Failed to build query embedding");
     }
 
     const fetchK = useRerank ? rerankCandidateCount(topK) : topK;
@@ -89,11 +69,9 @@ export async function POST(req: Request) {
     });
     let raw;
     if (useHybrid) {
-      raw = await hybridSearchDb(searchQuery, queryEmbedding, fetchK, filterDocumentId);
-    } else if (filterDocumentId) {
-      raw = await vectorSearchFiltered(queryEmbedding, fetchK, filterDocumentId);
+      raw = await hybridSearchDb(supabase, searchQuery, queryEmbedding, fetchK, filterDocumentId);
     } else {
-      raw = await vectorSearch(queryEmbedding, fetchK);
+      raw = await vectorSearch(supabase, queryEmbedding, fetchK, filterDocumentId);
     }
     searchSpan?.end({ output: { candidates: raw.length } });
 
@@ -107,7 +85,7 @@ export async function POST(req: Request) {
       rerankSpan?.end({ output: raw.map((d) => ({ id: d.id, chunkIndex: d.metadata.chunkIndex })) });
     }
 
-    const results = await vectorDocsToRetrievalResults(raw);
+    const results = await vectorDocsToRetrievalResults(supabase, raw);
     trace?.update({
       output: {
         resultCount: results.length,
@@ -129,9 +107,6 @@ export async function POST(req: Request) {
     console.error("[api/retrieve]", e);
     trace?.update({ output: { error: e instanceof Error ? e.message : String(e) } });
     await flushTraces();
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : String(e) },
-      { status: 500 }
-    );
+    return apiError(500, "internal_error", "Retrieval failed");
   }
 }

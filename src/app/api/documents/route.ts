@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
-import { getSupabaseAdmin, isSupabaseConfigured } from "@/lib/supabase/server";
+import { requireUser } from "@/lib/auth";
+import { guardRequest } from "@/lib/apiGuard";
+import { apiError } from "@/lib/api/http";
 
 function mapRow(row: Record<string, unknown>) {
   const uploaded = row.uploaded_at as string | null;
@@ -18,15 +20,11 @@ function mapRow(row: Record<string, unknown>) {
   };
 }
 
-export async function GET() {
+export async function GET(req: Request) {
+  const auth = await requireUser(req);
+  if (!auth.ok) return auth.response;
+  const { supabase } = auth;
   try {
-    if (!isSupabaseConfigured()) {
-      throw new Error(
-        "Supabase env not configured (SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL)"
-      );
-    }
-
-    const supabase = getSupabaseAdmin();
     const { data: docs, error } = await supabase
       .from("documents")
       .select("*")
@@ -50,23 +48,19 @@ export async function GET() {
     });
   } catch (error: unknown) {
     console.error("[API /documents ERROR]:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message || "Unknown error" : "Unknown error" },
-      { status: 500 }
-    );
+    return apiError(500, "internal_error", "Request failed");
   }
 }
 
-/** Delete all documents (chunks cascade via FK). */
-export async function DELETE() {
+/** Delete ALL of the caller's documents (RLS scopes it to their own; chunks cascade via FK). */
+export async function DELETE(req: Request) {
+  // Wipes everything — the most destructive call in the API.
+  const blocked = guardRequest(req, { name: "documents-delete-all", limit: 5 });
+  if (blocked) return blocked;
+  const auth = await requireUser(req);
+  if (!auth.ok) return auth.response;
+  const { supabase } = auth;
   try {
-    if (!isSupabaseConfigured()) {
-      throw new Error(
-        "Supabase env not configured (SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL)"
-      );
-    }
-
-    const supabase = getSupabaseAdmin();
     const { error } = await supabase
       .from("documents")
       .delete()
@@ -80,9 +74,6 @@ export async function DELETE() {
     return NextResponse.json({ ok: true });
   } catch (error: unknown) {
     console.error("[API /documents ERROR]:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message || "Unknown error" : "Unknown error" },
-      { status: 500 }
-    );
+    return apiError(500, "internal_error", "Request failed");
   }
 }

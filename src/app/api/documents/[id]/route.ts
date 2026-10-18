@@ -1,29 +1,29 @@
 import { NextResponse } from "next/server";
-import { getSupabaseAdmin, isSupabaseConfigured } from "@/lib/supabase/server";
+import { requireUser } from "@/lib/auth";
+import { guardRequest } from "@/lib/apiGuard";
+import { apiError, validate } from "@/lib/api/http";
+import { documentIdParamSchema } from "@/lib/api/schemas";
 
 export async function DELETE(
-  _req: Request,
+  req: Request,
   context: { params: Promise<{ id: string }> }
 ) {
-  if (!isSupabaseConfigured()) {
-    return NextResponse.json({ error: "Supabase is not configured" }, { status: 503 });
-  }
+  // Destructive — same-origin only, and rate-limited against delete storms.
+  const blocked = guardRequest(req, { name: "documents-delete", limit: 20 });
+  if (blocked) return blocked;
+  const auth = await requireUser(req);
+  if (!auth.ok) return auth.response;
+  const { supabase } = auth;
 
-  const { id } = await context.params;
-  if (!id) {
-    return NextResponse.json({ error: "Missing id" }, { status: 400 });
-  }
+  const params = validate(documentIdParamSchema, await context.params);
+  if (!params.ok) return params.response;
 
   try {
-    const supabase = getSupabaseAdmin();
-    const { error } = await supabase.from("documents").delete().eq("id", id);
+    const { error } = await supabase.from("documents").delete().eq("id", params.data.id);
     if (error) throw new Error(error.message);
     return NextResponse.json({ ok: true });
   } catch (e) {
     console.error("[api/documents/[id] DELETE]", e);
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : String(e) },
-      { status: 500 }
-    );
+    return apiError(500, "internal_error", "Failed to delete document");
   }
 }

@@ -2,6 +2,10 @@ import { NextResponse } from "next/server";
 import { generateText as generateGroq, openGroqChatTextStream, groqModelName } from "@/lib/groq";
 import { generateText as generateGemini, openGeminiChatTextStream, GEMINI_TEXT_MODEL } from "@/lib/gemini";
 import { startTrace, flushTraces, tapTextStream } from "@/lib/observability";
+import { guardRequest } from "@/lib/apiGuard";
+import { requireUser } from "@/lib/auth";
+import { apiError, parseBody } from "@/lib/api/http";
+import { chatSchema } from "@/lib/api/schemas";
 
 const GROQ_MODEL = groqModelName();
 const GEMINI_MODEL = GEMINI_TEXT_MODEL;
@@ -66,12 +70,17 @@ const streamHeaders = {
  * - Document summary → { mode: "summary", ... } (JSON, non-streaming)
  */
 export async function POST(req: Request) {
+  // LLM generation is the most expensive call — cap it tightest.
+  const blocked = guardRequest(req, { name: "chat", limit: 20 });
+  if (blocked) return blocked;
+  // Burns LLM / embedding quota — signed-in users only.
+  const auth = await requireUser(req);
+  if (!auth.ok) return auth.response;
+  const parsed = await parseBody(req, chatSchema);
+  if (!parsed.ok) return parsed.response;
+  const { prompt } = parsed.data;
+
   try {
-    const body = (await req.json()) as { prompt?: unknown };
-    const prompt = typeof body.prompt === "string" ? body.prompt : "";
-    if (!prompt) {
-      return NextResponse.json({ error: "Expected body: { prompt: string }" }, { status: 400 });
-    }
 
     const isSummary =
       prompt.includes("Summarize this document") && prompt.includes("Respond ONLY in JSON");
@@ -174,7 +183,8 @@ export async function POST(req: Request) {
         }
       }
     }
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  } catch (e) {
+    console.error("[api/chat] unexpected", e);
+    return apiError(500, "internal_error", "Chat request failed");
   }
 }
