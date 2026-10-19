@@ -1,5 +1,6 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
+import { normalizeSupabaseUrl } from "@/lib/supabase/url";
 
 /**
  * Runs on every page request (not static assets):
@@ -13,7 +14,7 @@ import { NextResponse, type NextRequest } from "next/server";
 const PUBLIC_PREFIXES = ["/login", "/auth/"];
 
 export async function middleware(request: NextRequest) {
-  const url = process.env.SUPABASE_URL?.trim() || process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+  const url = normalizeSupabaseUrl(process.env.SUPABASE_URL) ?? normalizeSupabaseUrl(process.env.NEXT_PUBLIC_SUPABASE_URL);
   const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
   // Not configured (fresh clone): let the app render; the UI surfaces the config error.
   if (!url || !anon) return NextResponse.next({ request });
