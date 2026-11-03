@@ -1,5 +1,6 @@
 "use client";
 
+import ThemeToggle from "@/components/ThemeToggle";
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { getSupabaseBrowser } from "@/lib/supabase/client";
@@ -7,7 +8,7 @@ import { getSupabaseBrowser } from "@/lib/supabase/client";
 type Mode = "signin" | "signup";
 
 const field =
-  "w-full rounded-xl border border-white/10 bg-white/5 px-3.5 py-2.5 text-sm text-[var(--text-bright)] outline-none transition focus:border-[var(--focus-ring)]";
+  "w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2.5 text-sm text-[var(--text-bright)] outline-none transition focus:border-[var(--focus-ring)]";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -59,12 +60,13 @@ export default function LoginPage() {
   }
 
   return (
-    <main className="flex h-full w-full items-center justify-center overflow-y-auto p-4">
+    <main className="relative flex h-full w-full items-center justify-center overflow-y-auto p-4">
+      <ThemeToggle className="absolute right-4 top-4" />
       <div
-        className="w-full max-w-sm rounded-2xl border border-white/10 p-6"
-        style={{ background: "var(--surface)" }}
+        className="w-full max-w-sm rounded-2xl border border-[var(--border)] p-6 sm:p-8"
+        style={{ background: "var(--surface)", boxShadow: "var(--shadow-lg)" }}
       >
-        <h1 className="text-xl font-semibold text-[var(--text-bright)]">RAGBase</h1>
+        <h1 className="font-display text-3xl font-medium tracking-tight text-[var(--text-bright)]">RAGBase</h1>
         <p className="mt-1 text-sm text-[var(--text)]">
           {mode === "signin" ? "Sign in to your document workspace." : "Create an account to get started."}
         </p>
@@ -108,8 +110,8 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={busy}
-            className="w-full rounded-xl px-4 py-2.5 text-sm font-semibold text-black transition disabled:opacity-50"
-            style={{ background: "var(--primary)" }}
+            className="w-full rounded-xl px-4 py-2.5 text-sm font-semibold transition hover:opacity-90 disabled:opacity-50"
+            style={{ background: "var(--btn-bg)", color: "var(--btn-fg)" }}
           >
             {busy ? "Please wait…" : mode === "signin" ? "Sign in" : "Create account"}
           </button>
@@ -128,16 +130,16 @@ export default function LoginPage() {
         </button>
 
         <div className="my-4 flex items-center gap-3 text-xs text-[var(--text)]">
-          <span className="h-px flex-1 bg-white/10" />
+          <span className="h-px flex-1 bg-[var(--border)]" />
           or
-          <span className="h-px flex-1 bg-white/10" />
+          <span className="h-px flex-1 bg-[var(--border)]" />
         </div>
 
         <button
           type="button"
           onClick={continueAsGuest}
           disabled={busy}
-          className="w-full rounded-xl border border-white/10 px-4 py-2.5 text-sm text-[var(--text-bright)] transition hover:bg-white/5 disabled:opacity-50"
+          className="w-full rounded-xl border border-[var(--border)] px-4 py-2.5 text-sm text-[var(--text-bright)] transition hover:bg-[var(--panel-hover)] disabled:opacity-50"
         >
           Continue as guest
         </button>

@@ -24,6 +24,8 @@ Unit tests (Vitest) cover pure logic and the security seams: schemas, error/body
 
 Design decisions and their reasoning live in `docs/ARCHITECTURE.md` — read it before changing auth, RLS, search, or the API contract.
 
+**Do not run `npm run build` while `npm run dev` is running** — both write `.next`, and the dev server then serves pages with no CSS. Stop dev first (or use `npm run dev:clean` afterwards).
+
 ## Environment Variables
 
 Copy `.env.example` to `.env.local`. Required keys:
@@ -124,6 +126,16 @@ pdf.js is loaded dynamically from CDN at runtime in the client component (no npm
 | `src/lib/supabase/env.ts` | URL / anon-key resolution |
 
 `scripts/reembed.ts` builds its own service-role client (admin job, intentionally bypasses RLS).
+
+### Theming & responsive UI
+
+- Dark is the default (the `:root` token block); light is `<html data-theme="light">`. All colors are CSS variables in `src/app/globals.css` (`:root` / `:root[data-theme="light"]`) — use `var(--…)` tokens, never hardcode hex/rgba (the inline `S` style object in `RAGBase.tsx` already follows this). Don't build colors by string-concatenating `"var(--x)" + "18"` (invalid CSS); use `color-mix(in srgb, var(--x) 10%, transparent)`.
+- Status colors are one language: `--accent` green = ready/good, `--warn` amber = processing/medium, `--danger` red = failed/weak, `--info` blue = sources. Use `.chip .chip-ok|warn|danger|info`.
+- Theme choice: `ThemeToggle` (localStorage key `THEME_KEY` in `src/lib/theme.ts`), applied pre-paint by the inline script in `layout.tsx`. `<html>` persists across client navigations, so no re-apply is needed.
+- Fonts (loaded in `layout.tsx` via `next/font`): Instrument Sans (`--font-sans`, body), Fraunces (`--font-display`, headings/wordmark), JetBrains Mono (`--font-mono`). Tailwind's `font-sans/mono/display` are mapped to these in `tailwind.config.ts` — do **not** write literal family names (`'Outfit'`, `'IBM Plex Mono'`) in inline styles; next/font mangles family names so literals silently fall back to system fonts. Restart `npm run dev` after editing `tailwind.config.ts`.
+- Page-load motion: `.reveal` staggers its children (`--d` sets a group delay); the hero uses it. `prefers-reduced-motion` disables it globally.
+- Tailwind **preflight is disabled** (`tailwind.config.ts`); `globals.css` carries a minimal `@layer base` reset (box-sizing, borders, button/input resets, body margin). New elements may need it in mind.
+- Phone rules: `.app-shell` uses `100dvh` + safe-area insets; inputs are 16px on touch (prevents iOS zoom); grid/flex children get `min-width: 0` so charts can't widen the page. Native `prompt()`/`confirm()` are replaced by `src/components/Dialog.tsx`.
 
 ### `next.config.js` notes
 

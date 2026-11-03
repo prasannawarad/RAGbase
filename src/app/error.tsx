@@ -17,21 +17,21 @@ export default function Error({
   return (
     <div
       style={{
-        minHeight: "100vh",
+        minHeight: "100dvh",
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
         padding: 24,
-        background: "#08090E",
-        color: "#E4E7F0",
+        background: "var(--bg)",
+        color: "var(--text-bright)",
         fontFamily: "system-ui, sans-serif",
       }}
     >
       <h2 style={{ fontSize: 18, marginBottom: 8 }}>Something went wrong</h2>
       <pre
         style={{
-          color: "#EF476F",
+          color: "var(--danger)",
           fontSize: 13,
           maxWidth: 560,
           whiteSpace: "pre-wrap",
@@ -46,9 +46,9 @@ export default function Error({
         style={{
           padding: "8px 16px",
           borderRadius: 6,
-          border: "1px solid #252940",
-          background: "#171A26",
-          color: "#E4E7F0",
+          border: "1px solid var(--border2)",
+          background: "var(--surface)",
+          color: "var(--text-bright)",
           cursor: "pointer",
         }}
       >
