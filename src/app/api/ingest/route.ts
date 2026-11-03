@@ -1,201 +1,138 @@
 import { NextResponse } from "next/server";
-import { getSupabaseAdmin, isSupabaseConfigured } from "@/lib/supabase/server";
-import { toVectorParam } from "@/lib/search";
-import { embedTexts } from "@/lib/gemini";
-import { mockEmbeddingsForTexts } from "@/lib/embedFallback";
+import { apiError, devDetails, parseBody } from "@/lib/api/http";
+import { ingestSchema, LIMITS } from "@/lib/api/schemas";
+import { requireUser } from "@/lib/auth";
+import { guardDailyBudget, guardRequest, guardUser } from "@/lib/apiGuard";
+import { contentHash } from "@/lib/ingestStore";
 
-/**
- * Body (minimum):
- *   { documentName: string, chunks: string[] }
- *
- * Optional (preserves upload metadata / UI):
- *   fileType?: string
- *   pages?: number | null
- */
-type IngestBody = {
-  documentName?: unknown;
-  chunks?: unknown;
-  fileType?: unknown;
-  pages?: unknown;
+const STAGE_INSERT_BATCH = 500;
+
+type DocRow = {
+  id: string;
+  name: string;
+  raw_text: string | null;
+  chunk_count: number;
+  chunks_done: number;
+  char_count: number | null;
+  word_count: number | null;
+  avg_chunk_size: number | null;
+  pages: number | null;
+  file_type: string | null;
+  status: string | null;
+  uploaded_at: string;
 };
 
+const DOC_COLUMNS =
+  "id, name, raw_text, chunk_count, chunks_done, char_count, word_count, avg_chunk_size, pages, file_type, status, uploaded_at";
+
+function toClientDocument(row: DocRow) {
+  return {
+    id: row.id,
+    name: row.name,
+    text: row.raw_text ?? "",
+    chunks: row.chunk_count,
+    chunksDone: row.chunks_done,
+    charCount: row.char_count ?? 0,
+    wordCount: row.word_count ?? 0,
+    avgChunkSize: row.avg_chunk_size ?? 0,
+    pages: row.pages,
+    fileType: row.file_type ?? "text",
+    status: row.status ?? "queued",
+    uploadedAt: new Date(row.uploaded_at).toLocaleString(),
+  };
+}
+
+/**
+ * Stage 4: ingestion is a two-step, resumable pipeline.
+ *   POST /api/ingest              validate + dedup + store the chunk TEXT (fast, no embedding)  -> 202
+ *   POST /api/ingest/:id/process  embed in small batches until the document is 'indexed'
+ *
+ * Re-uploading identical text is a no-op: the existing document is returned (200, duplicate: true),
+ * so no embedding quota is spent twice.
+ */
 export async function POST(req: Request) {
-  if (!isSupabaseConfigured()) {
-    return NextResponse.json(
-      {
-        error:
-          "Supabase is not configured (set SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL)",
-      },
-      { status: 503 }
-    );
-  }
+  // Writes rows — keep it low.
+  const blocked = await guardRequest(req, { name: "ingest", limit: 10 });
+  if (blocked) return blocked;
+  const auth = await requireUser(req);
+  if (!auth.ok) return auth.response;
+  const { supabase, user } = auth;
+  const perUser =
+    (await guardUser(user.id, { name: "ingest", limit: 10 })) ??
+    (await guardDailyBudget(user.id, "ingest", 100));
+  if (perUser) return perUser;
 
-  let body: IngestBody;
-  try {
-    body = (await req.json()) as IngestBody;
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
-  }
+  const parsed = await parseBody(req, ingestSchema, LIMITS.bodyBytesIngest);
+  if (!parsed.ok) return parsed.response;
+  const { documentName, chunks, pages = null } = parsed.data;
+  const fileType = parsed.data.fileType ?? "text";
 
-  const documentName = typeof body.documentName === "string" ? body.documentName.trim() : "";
-  if (!documentName) {
-    return NextResponse.json(
-      {
-        error:
-          "Expected body: { documentName: string, chunks: string[], fileType?: string, pages?: number | null }",
-      },
-      { status: 400 }
-    );
-  }
+  const hash = contentHash(chunks);
 
-  const rawChunks = body.chunks;
-  if (!Array.isArray(rawChunks) || rawChunks.length === 0) {
-    return NextResponse.json({ error: "No chunks provided" }, { status: 400 });
-  }
+  const findExisting = async () => {
+    const { data } = await supabase
+      .from("documents")
+      .select(DOC_COLUMNS)
+      .eq("user_id", user.id)
+      .eq("content_hash", hash)
+      .maybeSingle();
+    return (data as DocRow | null) ?? null;
+  };
 
-  const chunks = rawChunks.map((c) => String(c));
-
-  if (chunks.some((t) => !t.trim())) {
-    return NextResponse.json({ error: "chunks must be non-empty strings" }, { status: 400 });
-  }
-
-  const fileType = typeof body.fileType === "string" && body.fileType.trim() ? body.fileType.trim() : "text";
-  const pages =
-    typeof body.pages === "number" && Number.isFinite(body.pages)
-      ? body.pages
-      : body.pages === null
-        ? null
-        : null;
-
-  let embeddings: number[][];
-  try {
-    embeddings = await embedTexts(chunks);
-  } catch {
-    embeddings = mockEmbeddingsForTexts(chunks);
-  }
-
-  if (!embeddings || embeddings.length !== chunks.length) {
-    return NextResponse.json({ error: "Embedding mismatch" }, { status: 500 });
-  }
-
-  if (embeddings[0]?.length !== 768) {
-    return NextResponse.json({ error: "Invalid embedding dimension" }, { status: 500 });
+  const existing = await findExisting();
+  if (existing) {
+    return NextResponse.json({ document: toClientDocument(existing), duplicate: true });
   }
 
   const rawText = chunks.join("\n\n");
-  const charCount = rawText.length;
-  const wordCount = rawText.split(/\s+/).filter(Boolean).length || 0;
-  const avgChunkSize =
-    chunks.length > 0
-      ? Math.round(chunks.reduce((acc, c) => acc + c.length, 0) / chunks.length)
-      : 0;
-  const uploadedAt = new Date().toISOString();
+  const avgChunkSize = Math.round(chunks.reduce((acc, c) => acc + c.length, 0) / chunks.length);
 
-  const supabase = getSupabaseAdmin();
-
-  const { data: insertedDocs, error } = await supabase
+  const { data: inserted, error } = await supabase
     .from("documents")
     .insert({
+      user_id: user.id,
       name: documentName,
       raw_text: rawText,
-      char_count: charCount,
-      word_count: wordCount,
+      char_count: rawText.length,
+      word_count: rawText.split(/\s+/).filter(Boolean).length,
       chunk_count: chunks.length,
+      chunks_done: 0,
       avg_chunk_size: avgChunkSize,
       pages,
       file_type: fileType,
-      status: "indexed",
-      uploaded_at: uploadedAt,
+      status: "queued",
+      content_hash: hash,
     })
-    .select("id");
+    .select(DOC_COLUMNS)
+    .single();
 
-  const docRow = insertedDocs?.[0];
-
-  if (error) {
-    console.error("[INGEST ERROR - DOCUMENT INSERT]:", {
-      message: error.message,
-      code: error.code,
-      details: error.details,
-      hint: error.hint,
-    });
-
-    return NextResponse.json(
-      {
-        error: "Failed to insert document",
-        details: error.message,
-        code: error.code,
-        hint: error.hint,
-        supabaseDetails: error.details,
-      },
-      { status: 500 }
-    );
+  if (error || !inserted) {
+    // Two identical uploads racing past the check above: the unique index decides, return the winner.
+    if (error?.code === "23505") {
+      const winner = await findExisting();
+      if (winner) return NextResponse.json({ document: toClientDocument(winner), duplicate: true });
+    }
+    console.error("[INGEST ERROR - DOCUMENT INSERT]:", error);
+    return apiError(500, "internal_error", "Failed to create document", devDetails(error?.message));
   }
 
-  if (!docRow) {
-    console.error("[INGEST ERROR - DOCUMENT INSERT]:", "No row returned");
-    return NextResponse.json(
-      {
-        error: "Failed to insert document",
-        details: "No row returned",
-      },
-      { status: 500 }
-    );
-  }
+  const docId = (inserted as DocRow).id;
 
-  const docId = docRow.id as string;
-
-  const rows = chunks.map((text, i) => {
-    const wordCountChunk = text.split(/\s+/).filter(Boolean).length || 0;
-    return {
+  for (let i = 0; i < chunks.length; i += STAGE_INSERT_BATCH) {
+    const rows = chunks.slice(i, i + STAGE_INSERT_BATCH).map((content, j) => ({
       document_id: docId,
-      chunk_index: i,
-      content: text,
-      word_count: wordCountChunk,
-      embedding: toVectorParam(embeddings[i]!),
-      metadata: {
-        docName: documentName,
-        docId,
-      },
-    };
-  });
-
-  const { error: chunkError } = await supabase.from("chunks").insert(rows);
-
-  if (chunkError) {
-    console.error("[INGEST ERROR - CHUNKS INSERT]:", {
-      message: chunkError.message,
-      code: chunkError.code,
-      details: chunkError.details,
-      hint: chunkError.hint,
-    });
-
-    await supabase.from("documents").delete().eq("id", docId);
-
-    return NextResponse.json(
-      {
-        error: "Failed to insert chunks",
-        details: chunkError.message,
-        code: chunkError.code,
-        hint: chunkError.hint,
-        supabaseDetails: chunkError.details,
-      },
-      { status: 500 }
-    );
+      user_id: user.id,
+      chunk_index: i + j,
+      content,
+    }));
+    const { error: stageError } = await supabase.from("ingest_chunks").insert(rows);
+    if (stageError) {
+      console.error("[INGEST ERROR - STAGING]:", stageError);
+      // Cascade removes any staging rows already written.
+      await supabase.from("documents").delete().eq("id", docId);
+      return apiError(500, "internal_error", "Failed to queue chunks", devDetails(stageError.message));
+    }
   }
 
-  return NextResponse.json({
-    document: {
-      id: docId,
-      name: documentName,
-      text: rawText,
-      chunks: chunks.length,
-      charCount: charCount,
-      wordCount: wordCount,
-      avgChunkSize,
-      pages,
-      fileType,
-      status: "indexed" as const,
-      uploadedAt: new Date(uploadedAt).toLocaleString(),
-    },
-  });
+  return NextResponse.json({ document: toClientDocument(inserted as DocRow), duplicate: false }, { status: 202 });
 }

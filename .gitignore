@@ -39,3 +39,6 @@ yarn-error.log*
 # evals (local golden dataset + run outputs)
 /evals/dataset.json
 /evals/results/
+
+# superpowers brainstorming mockups
+.superpowers/

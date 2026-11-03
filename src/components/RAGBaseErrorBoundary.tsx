@@ -28,27 +28,27 @@ export class RAGBaseErrorBoundary extends Component<Props, State> {
         <div
           style={{
             padding: 24,
-            color: "rgba(243,246,255,0.94)",
-            background: "#07080c",
-            minHeight: "100vh",
+            color: "var(--text-bright)",
+            background: "var(--bg)",
+            minHeight: "100dvh",
             fontFamily: "'Outfit', system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
           }}
         >
           <h1 style={{ fontSize: 18, marginBottom: 12, letterSpacing: "-0.01em" }}>
             RAGBase — runtime error
           </h1>
-          <p style={{ color: "rgba(223,230,242,0.68)", marginBottom: 8 }}>
+          <p style={{ color: "var(--text)", marginBottom: 8 }}>
             Check the browser console for full details.
           </p>
           <pre
             style={{
               whiteSpace: "pre-wrap",
-              color: "rgba(251,113,133,0.95)",
+              color: "var(--danger)",
               fontSize: 13,
               padding: 12,
-              background: "rgba(21,23,33,0.82)",
+              background: "var(--surface2)",
               borderRadius: 14,
-              border: "1px solid rgba(255,255,255,0.10)",
+              border: "1px solid var(--border)",
             }}
           >
             {this.state.message}
@@ -60,10 +60,10 @@ export class RAGBaseErrorBoundary extends Component<Props, State> {
               marginTop: 16,
               padding: "8px 16px",
               borderRadius: 12,
-              border: "1px solid rgba(255,255,255,0.10)",
+              border: "1px solid var(--border)",
               cursor: "pointer",
-              background: "linear-gradient(135deg, rgba(125,211,252,0.95), rgba(56,189,248,0.85))",
-              color: "rgba(8,10,14,0.92)",
+              background: "var(--btn-bg)",
+              color: "var(--btn-fg)",
               fontWeight: 800,
             }}
           >

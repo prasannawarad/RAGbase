@@ -1,23 +1,23 @@
 import { NextResponse } from "next/server";
-import { getSupabaseAdmin, isSupabaseConfigured } from "@/lib/supabase/server";
+import { requireUser } from "@/lib/auth";
 import type { VectorDoc } from "@/lib/vectorStore";
 import { tokenize } from "@/lib/tokenizer";
+import { apiError, validate } from "@/lib/api/http";
+import { documentIdParamSchema } from "@/lib/api/schemas";
 
 export async function GET(
-  _req: Request,
+  req: Request,
   context: { params: Promise<{ id: string }> }
 ) {
-  if (!isSupabaseConfigured()) {
-    return NextResponse.json({ error: "Supabase is not configured", chunks: [] }, { status: 503 });
-  }
+  const auth = await requireUser(req);
+  if (!auth.ok) return auth.response;
+  const { supabase } = auth;
 
-  const { id: documentId } = await context.params;
-  if (!documentId) {
-    return NextResponse.json({ error: "Missing id" }, { status: 400 });
-  }
+  const params = validate(documentIdParamSchema, await context.params);
+  if (!params.ok) return params.response;
+  const documentId = params.data.id;
 
   try {
-    const supabase = getSupabaseAdmin();
     const { data, error } = await supabase
       .from("chunks")
       .select("id, content, document_id, chunk_index, word_count, metadata")
@@ -45,9 +45,6 @@ export async function GET(
     return NextResponse.json({ chunks });
   } catch (e) {
     console.error("[api/documents/[id]/chunks]", e);
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : String(e), chunks: [] },
-      { status: 500 }
-    );
+    return apiError(500, "internal_error", "Failed to load chunks", { chunks: [] });
   }
 }

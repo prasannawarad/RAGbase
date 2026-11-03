@@ -1,5 +1,7 @@
 "use client";
 
+import ThemeToggle from "./ThemeToggle";
+import Dialog from "./Dialog";
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import type { ChangeEvent, CSSProperties, DragEvent } from "react";
 
@@ -60,6 +62,8 @@ type StoredDocument = {
   pages?: number | null;
   fileType?: string;
   status?: string;
+  chunksDone?: number;
+  error?: string | null;
   uploadedAt?: string;
 };
 
@@ -179,6 +183,59 @@ async function readJsonOnce<T>(res: Response): Promise<{ parsed: T | null; parse
     return { parsed, parseError: false };
   } catch {
     return { parsed: null, parseError: true };
+  }
+}
+
+type IngestProgress = {
+  status: "queued" | "processing" | "indexed" | "failed";
+  chunksDone: number;
+  chunkCount: number;
+  error?: string;
+  retrying?: boolean;
+};
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Drives server-side ingestion of one document to completion by calling the idempotent
+ * /api/ingest/:id/process endpoint until the document is indexed or failed. Safe to call again
+ * after a reload: the server keeps the staged chunks, so work resumes where it stopped.
+ */
+async function driveIngestion(
+  docId: string,
+  onProgress: (p: IngestProgress) => void,
+  opts: { retry?: boolean } = {}
+): Promise<IngestProgress> {
+  let query = opts.retry ? "?retry=1" : "";
+  let lastDone = -1;
+  let stalls = 0;
+  for (;;) {
+    const res = await fetch(`/api/ingest/${docId}/process${query}`, { method: "POST" });
+    query = "";
+    if (res.status === 429) {
+      await sleep((Number(res.headers.get("Retry-After")) || 5) * 1000);
+      continue;
+    }
+    if (res.status === 401) {
+      window.location.href = "/login";
+      throw new Error("Session expired");
+    }
+    const { parsed, parseError } = await readJsonOnce<IngestProgress & { code?: string }>(res);
+    if (!res.ok || parseError || !parsed) {
+      throw new Error((!parseError && parsed?.error) || `Ingestion step failed (${res.status})`);
+    }
+    onProgress(parsed);
+    if (parsed.status === "indexed" || parsed.status === "failed") return parsed;
+
+    if (parsed.chunksDone > lastDone) {
+      stalls = 0;
+      lastDone = parsed.chunksDone;
+    } else {
+      // No progress (embedding error being retried, or another tab holds the lease): back off.
+      stalls++;
+      if (stalls > 20) throw new Error("Ingestion is not making progress");
+      await sleep(Math.min(2000 * stalls, 15000));
+    }
   }
 }
 
@@ -345,6 +402,25 @@ function parseStreamedResponse(fullText: string) {
 }
 
 // ─── Constants ───────────────────────────────────────────────
+/** One place for the match-quality thresholds, so chips, borders and bars never disagree. */
+function scoreTone(v: number): { chip: string; label: string; color: string } {
+  if (v >= 0.6) return { chip: "chip-ok", label: "Strong", color: "var(--accent)" };
+  if (v >= 0.4) return { chip: "chip-warn", label: "Fair", color: "var(--warn)" };
+  return { chip: "chip-danger", label: "Weak", color: "var(--danger)" };
+}
+
+/** Keyboard activation (Enter/Space) for non-button elements that act like buttons, radios or checkboxes. */
+function onActivate(action: () => void) {
+  return (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      action();
+    }
+  };
+}
+
+const SUPPORTED_EXTENSIONS = ["txt", "md", "csv", "pdf"];
+
 const VIEWS = {
   UPLOAD: "upload", DOCUMENTS: "documents", CHAT: "chat",
   CHUNKS: "chunks", ANALYTICS: "analytics", PIPELINE: "pipeline",
@@ -406,6 +482,8 @@ export default function RAGBase() {
 
   const [error, setError] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [confirmClearOpen, setConfirmClearOpen] = useState(false);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const chatInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -485,11 +563,18 @@ export default function RAGBase() {
   }, [showRetrieval]);
 
   // ─── Load documents from Supabase (mount + Retry) ────────────
-  const refetchDocuments = useCallback(async () => {
+  const refetchDocuments = useCallback(async (quiet = false) => {
     try {
-      setDbLoading(true);
-      setDocsLoading(true);
+      if (!quiet) {
+        setDbLoading(true);
+        setDocsLoading(true);
+      }
       const res = await fetch("/api/documents");
+      if (res.status === 401) {
+        // Session expired mid-use — middleware will send us to the login page.
+        window.location.href = "/login";
+        return;
+      }
       if (!res.ok) {
         const { parsed: errBody } = await readJsonOnce<{ error?: string }>(res);
         const msg = errBody?.error || `Failed to load documents (${res.status})`;
@@ -519,7 +604,7 @@ export default function RAGBase() {
       setTotalChunks(data.totalChunks ?? 0);
       if (docs.length) {
         setDbSynced(true);
-        setView(VIEWS.CHAT);
+        if (!quiet) setView(VIEWS.CHAT);
       }
     } catch (error: unknown) {
       console.error("Documents API failed:", error);
@@ -528,14 +613,49 @@ export default function RAGBase() {
       setDocsError(error instanceof Error ? error.message : "Failed to load documents");
       setDbSynced(false);
     } finally {
-      setDbLoading(false);
-      setDocsLoading(false);
+      if (!quiet) {
+        setDbLoading(false);
+        setDocsLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
     void refetchDocuments();
   }, [refetchDocuments]);
+
+  // Resume ingestion for documents left unfinished (tab closed or reloaded mid-upload).
+  const resumingRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const d of documents) {
+      if ((d.status !== "queued" && d.status !== "processing") || resumingRef.current.has(d.id)) continue;
+      resumingRef.current.add(d.id);
+      void driveIngestion(d.id, (p) =>
+        setDocuments((prev) =>
+          prev.map((x) => (x.id === d.id ? { ...x, status: p.status, chunksDone: p.chunksDone, error: p.error ?? null } : x))
+        )
+      )
+        .then(() => refetchDocuments(true))
+        .catch((err) => console.error("[resume ingestion]", d.id, err))
+        .finally(() => resumingRef.current.delete(d.id));
+    }
+  }, [documents, refetchDocuments]);
+
+  const retryIngestion = (docId: string) => {
+    if (resumingRef.current.has(docId)) return;
+    resumingRef.current.add(docId);
+    void driveIngestion(
+      docId,
+      (p) =>
+        setDocuments((prev) =>
+          prev.map((x) => (x.id === docId ? { ...x, status: p.status, chunksDone: p.chunksDone, error: p.error ?? null } : x))
+        ),
+      { retry: true }
+    )
+      .then(() => refetchDocuments(true))
+      .catch((err) => setError(errorToMessage(err)))
+      .finally(() => resumingRef.current.delete(docId));
+  };
 
   useEffect(() => {
     if (view !== VIEWS.CHUNKS || !documents.length) {
@@ -616,12 +736,12 @@ export default function RAGBase() {
             (doc.pages ? ` · ${doc.pages} pages` : "")
         );
 
-        setProcessStep(`Ingesting "${doc.name}" (${chunks.length} chunks, server-side embeddings)...`);
+        setProcessStep(`Queueing "${doc.name}" (${chunks.length} chunks)...`);
         const pct = 5 + Math.round((processedChunks / Math.max(totalChunkEstimate, 1)) * 75);
         setProcessProgress(pct);
 
         const chunkTexts = chunks.map((c) => c.text);
-        addLog(`POST /api/ingest — ${chunkTexts.length} chunks (embed + persist on server)`);
+        addLog(`POST /api/ingest — queueing ${chunkTexts.length} chunks`);
 
         const ingestPayload: {
           documentName: string;
@@ -671,7 +791,24 @@ export default function RAGBase() {
           throw new Error("Invalid response from ingest API");
         }
         if (!payload.document) throw new Error("Ingest returned no document");
-        createdDocs.push(payload.document);
+        let finalDoc = payload.document;
+        if ((payload as { duplicate?: boolean }).duplicate) {
+          addLog(`"${doc.name}" was already uploaded — reusing the existing copy (no embedding quota spent)`);
+        }
+        if (finalDoc.status !== "indexed") {
+          addLog(`Embedding "${doc.name}" in batches (resumable)…`);
+          const base = processedChunks;
+          const progress = await driveIngestion(finalDoc.id, (p) => {
+            setProcessStep(`Embedding "${doc.name}" — ${p.chunksDone}/${p.chunkCount} chunks`);
+            setProcessProgress(5 + Math.round(((base + p.chunksDone) / Math.max(totalChunkEstimate, 1)) * 75));
+          });
+          if (progress.status === "failed") {
+            throw new Error(`"${doc.name}" could not be indexed: ${progress.error ?? "unknown error"}. You can retry it from the Documents tab.`);
+          }
+          finalDoc = { ...finalDoc, status: "indexed", chunksDone: progress.chunksDone };
+        }
+        // A duplicate upload returns the existing document: don't list it twice.
+        if (!documents.some((d) => d.id === finalDoc.id)) createdDocs.push(finalDoc);
         processedChunks += chunks.length;
       }
 
@@ -706,11 +843,18 @@ export default function RAGBase() {
   // ─── File Handlers ───────────────────────────────────────────
   const handleFileUpload = async (e: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
+    // Reset so choosing the same file again still fires `change`. (The drop handler passes a plain object.)
+    if (e.target instanceof HTMLInputElement) e.target.value = "";
     if (!files.length) return;
     const texts = [];
 
     for (const file of files) {
       const ext = (file.name.split(".").pop() ?? "").toLowerCase();
+      if (!SUPPORTED_EXTENSIONS.includes(ext)) {
+        // The picker's `accept` is only a hint; "All files" still lets anything through.
+        setError(`"${file.name}" isn't supported. Use PDF, TXT, MD or CSV.`);
+        continue;
+      }
       if (ext === "pdf") {
         if (DEBUG_DISABLE_PDF) {
           setError(`PDF temporarily disabled (debug). Use .txt / .md / .csv for "${file.name}".`);
@@ -732,22 +876,21 @@ export default function RAGBase() {
     if (texts.length) processDocuments(texts);
   };
 
-  const handlePasteText = () => {
-    const text = prompt("Paste your document text:");
-    if (text?.trim())
-      processDocuments([{ name: `Pasted Doc ${documents.length + 1}`, text: text.trim(), fileType: "text" }]);
+  const handlePasteText = () => setPasteOpen(true);
+
+  const submitPastedText = (name: string, text: string) => {
+    setPasteOpen(false);
+    processDocuments([{ name: name || `Pasted Doc ${documents.length + 1}`, text, fileType: "text" }]);
   };
 
   const handleDrop = (e: DragEvent) => {
     e.preventDefault();
-    const files = Array.from(e.dataTransfer.files).filter((f) =>
-      /\.(txt|md|csv|pdf)$/i.test(f.name)
-    );
-    if (files.length) {
-      const dt = new DataTransfer();
-      files.forEach((f) => dt.items.add(f));
-      handleFileUpload({ target: { files: dt.files } } as ChangeEvent<HTMLInputElement>);
-    }
+    const dropped = Array.from(e.dataTransfer.files);
+    if (!dropped.length) return;
+    // Unsupported files are reported by handleFileUpload, so a bad drop is never silent.
+    const dt = new DataTransfer();
+    dropped.forEach((f) => dt.items.add(f));
+    handleFileUpload({ target: { files: dt.files } } as ChangeEvent<HTMLInputElement>);
   };
 
   const removeDocument = async (docId: string) => {
@@ -1026,7 +1169,7 @@ ${doc.text.substring(0, 3000)}`
 
   // ─── Clear All ───────────────────────────────────────────
   const clearAll = async () => {
-    if (!confirm("Clear all documents and chunks from Supabase?")) return;
+    setConfirmClearOpen(false);
     try {
       const res = await fetch("/api/documents", { method: "DELETE" });
       const { parsed: data, parseError } = await readJsonOnce<{ error?: string }>(res);
@@ -1072,9 +1215,9 @@ ${doc.text.substring(0, 3000)}`
             padding: "2px 8px",
             margin: "0 2px",
             borderRadius: 999,
-            border: "1px solid rgba(255,255,255,0.12)",
-            background: "rgba(125,211,252,0.08)",
-            color: "rgba(243,246,255,0.92)",
+            border: "1px solid var(--border)",
+            background: "var(--primary-soft)",
+            color: "var(--text-bright)",
             fontSize: 11,
             lineHeight: 1.4,
             cursor: "pointer",
@@ -1088,38 +1231,37 @@ ${doc.text.substring(0, 3000)}`
   }
 
   // ─── Sub-Components ──────────────────────────────────────
+  const chunkScore = (c: { vectorScore?: number; score?: number }) => (useHybridSearch ? c.vectorScore : c.score) ?? 0;
+
   const ConfBadge = ({ level }: { level: string }) => {
-    const c: Record<string, string> = { high: "#06D6A0", medium: "#FFD166", low: "#EF476F" };
+    const tone = level === "high" ? "chip-ok" : level === "medium" ? "chip-warn" : "chip-danger";
     return (
-      <span style={{
-        fontSize: 10, fontWeight: 800, padding: "2px 8px", borderRadius: 4,
-        textTransform: "uppercase", letterSpacing: "0.05em",
-        background: (c[level] || c.low) + "18", color: c[level] || c.low,
-        fontFamily: "var(--font-mono), ui-monospace, monospace",
-      }}>{level}</span>
+      <span className={`chip ${tone}`} style={{ textTransform: "uppercase", letterSpacing: "0.05em", fontWeight: 800, fontFamily: "var(--font-mono), ui-monospace, monospace" }}>
+        {level}
+      </span>
     );
   };
 
   const SearchModeBadge = ({ mode }: { mode: "hybrid" | "vector" }) => (
     <span style={{
-      fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
-      background: mode === "hybrid" ? "var(--accent2)" + "18" : "var(--primary)" + "18",
+      fontSize: 11, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
+      background: mode === "hybrid" ? "color-mix(in srgb, var(--accent2) 9%, transparent)" : "color-mix(in srgb, var(--primary) 9%, transparent)",
       color: mode === "hybrid" ? "var(--accent2)" : "var(--primary)",
-      fontFamily: "var(--font-mono), ui-monospace, monospace", textTransform: "uppercase",
+      fontFamily: "var(--font-mono), ui-monospace, monospace", textTransform: "uppercase", whiteSpace: "nowrap",
     }}>{mode === "hybrid" ? "⚡ Hybrid" : "◈ Vector"}</span>
   );
 
   const ScoreBar = ({ score, max = 1 }: { score: number; max?: number }) => (
     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-      <div style={{ flex: 1, height: 4, background: "#1A1D2E", borderRadius: 2, overflow: "hidden" }}>
+      <div style={{ flex: 1, height: 4, background: "var(--surface3)", borderRadius: 2, overflow: "hidden" }}>
         <div style={{
           width: `${(score / max) * 100}%`, height: "100%", borderRadius: 2,
-          background: score >= 0.7 ? "#06D6A0" : score >= 0.4 ? "#FFD166" : "#EF476F",
+          background: scoreTone(score).color,
           transition: "width 0.6s ease",
         }} />
       </div>
       <span style={{
-        fontSize: 11, fontWeight: 700, color: "#E4E7F0",
+        fontSize: 12, fontWeight: 700, color: "var(--text-bright)",
         fontFamily: "var(--font-mono), ui-monospace, monospace", minWidth: 40,
       }}>{(score * 100).toFixed(1)}%</span>
     </div>
@@ -1137,8 +1279,8 @@ ${doc.text.substring(0, 3000)}`
       style={{
         ...S.card,
         marginBottom: 16,
-        border: "1px solid rgba(239, 71, 111, 0.35)",
-        background: "rgba(239, 71, 111, 0.06)",
+        border: "1px solid color-mix(in srgb, var(--danger) 35%, transparent)",
+        background: "var(--danger-bg)",
       }}
     >
       <h3 style={{ fontSize: 15, fontWeight: 700, color: "var(--danger)", marginBottom: 10 }}>
@@ -1183,8 +1325,18 @@ ${doc.text.substring(0, 3000)}`
               flexShrink: 0,
             }}
           />
-          <span style={{ fontSize: 9, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace" }}>
+          <span style={{ fontSize: 11, color: "var(--text)", fontFamily: "var(--font-mono), ui-monospace, monospace" }}>
             {dbLoading ? "loading…" : dbSynced ? "Supabase synced" : "not persisted"}
+          </span>
+        </div>
+        <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 8 }}>
+          <form action="/auth/signout" method="post">
+            <button type="submit" className="hov" style={{ ...S.btnDanger, padding: "5px 10px", fontSize: 12 }}>
+              Sign out
+            </button>
+          </form>
+          <span className="hidden md:inline-flex">
+            <ThemeToggle />
           </span>
         </div>
       </div>
@@ -1215,13 +1367,13 @@ ${doc.text.substring(0, 3000)}`
             }}
           >
             <span style={{ fontSize: 14 }}>{item.icon}</span>
-            <span style={{ flex: 1, fontSize: 12 }}>{item.label}</span>
+            <span style={{ flex: 1, fontSize: 13 }}>{item.label}</span>
             {(item.count ?? 0) > 0 && <span style={S.badge}>{item.count}</span>}
           </button>
         ))}
       </div>
 
-      <div className="mt-auto flex shrink-0 flex-col border-t border-zinc-800/80 transition-all duration-200">
+      <div className="mt-auto flex shrink-0 flex-col border-t border-[var(--border)] transition-all duration-200">
         <div className="grid grid-cols-3 gap-1 px-3.5 py-2.5 text-center text-xs md:text-sm">
           {[
             { label: "Docs", value: documents.length, color: "var(--primary)" },
@@ -1229,7 +1381,7 @@ ${doc.text.substring(0, 3000)}`
             { label: "Queries", value: queryLog.length, color: "var(--accent2)" },
           ].map((s) => (
             <div key={s.label} style={S.statItem}>
-              <span className="break-words" style={{ fontSize: 10, color: "var(--text)" }}>
+              <span className="break-words" style={{ fontSize: 12, color: "var(--text)" }}>
                 {s.label}
               </span>
               <span
@@ -1237,7 +1389,7 @@ ${doc.text.substring(0, 3000)}`
                   fontSize: 14,
                   fontWeight: 800,
                   color: s.color,
-                  fontFamily: "'IBM Plex Mono', monospace",
+                  fontFamily: "var(--font-mono), ui-monospace, monospace",
                 }}
               >
                 {s.value}
@@ -1250,10 +1402,10 @@ ${doc.text.substring(0, 3000)}`
           <div style={{ marginBottom: 8, padding: "6px 10px", background: "var(--surface2)", borderRadius: 5 }}>
             <div
               style={{
-                fontSize: 9,
+                fontSize: 11,
                 color: "var(--text)",
                 marginBottom: 4,
-                fontFamily: "'IBM Plex Mono', monospace",
+                fontFamily: "var(--font-mono), ui-monospace, monospace",
                 textTransform: "uppercase",
               }}
             >
@@ -1269,17 +1421,16 @@ ${doc.text.substring(0, 3000)}`
                   onClick={() => setUseHybridSearch(opt.value)}
                   style={{
                     flex: 1,
-                    padding: "3px 0",
-                    fontSize: 10,
+                    padding: "6px 0",
+                    fontSize: 12,
                     fontWeight: 700,
                     border: "none",
-                    borderRadius: 4,
+                    borderRadius: 8,
                     cursor: "pointer",
-                    fontFamily: "'IBM Plex Mono', monospace",
-                    background: useHybridSearch === opt.value ? opt.color + "22" : "transparent",
+                    fontFamily: "var(--font-mono), ui-monospace, monospace",
+                    background: useHybridSearch === opt.value ? `color-mix(in srgb, ${opt.color} 14%, transparent)` : "transparent",
                     color: useHybridSearch === opt.value ? opt.color : "var(--text)",
-                    borderBottom:
-                      useHybridSearch === opt.value ? `1px solid ${opt.color}` : "1px solid transparent",
+                    boxShadow: useHybridSearch === opt.value ? `inset 0 0 0 1px color-mix(in srgb, ${opt.color} 35%, transparent)` : "none",
                   }}
                 >
                   {opt.label}
@@ -1297,11 +1448,11 @@ ${doc.text.substring(0, 3000)}`
   // ══════════════════════════════════════════════════════════
   return (
     <div
-      className="ragbase flex h-screen w-screen min-h-0 overflow-hidden bg-transparent font-sans text-[var(--text)] transition-all duration-200"
+      className="ragbase app-shell flex min-h-0 overflow-hidden bg-transparent font-sans text-[var(--text)] transition-all duration-200"
     >
       {sidebarOpen && (
         <div
-          className="fixed inset-0 z-40 bg-black/50 md:hidden"
+          className="fixed inset-0 z-40 bg-[var(--overlay)] md:hidden"
           aria-hidden="true"
           onClick={() => setSidebarOpen(false)}
         />
@@ -1310,7 +1461,7 @@ ${doc.text.substring(0, 3000)}`
       <div
         className={`
           fixed inset-y-0 left-0 z-50 flex h-full w-64 shrink-0 flex-col overflow-hidden
-          border-r border-white/10 bg-[#06060f]
+          border-r border-[var(--border)] bg-[var(--surface)]
           transition-transform duration-300 ease-out
           ${sidebarOpen ? "translate-x-0" : "-translate-x-full"}
           md:static md:inset-auto md:z-auto md:translate-x-0
@@ -1321,26 +1472,32 @@ ${doc.text.substring(0, 3000)}`
 
       {/* ─── Main ─── */}
       <div className="flex h-full min-h-0 flex-1 flex-col">
-        <div className="flex shrink-0 items-center justify-between border-b border-white/10 p-4 md:hidden">
-          <span className="font-semibold text-[var(--text-bright)]">RAGBase</span>
-          <button
+        <div className="mobile-bar flex shrink-0 items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 pb-3 md:hidden">
+          <span className="font-display text-lg font-semibold tracking-tight text-[var(--text-bright)]">RAGBase</span>
+          <div className="flex items-center gap-1">
+            <ThemeToggle />
+            <button
             type="button"
-            className="p-2 text-lg text-[var(--text-bright)] transition-all duration-200"
+            className="inline-flex h-10 w-10 items-center justify-center text-lg text-[var(--text-bright)] transition-all duration-200"
             onClick={() => setSidebarOpen((prev) => !prev)}
             aria-label={sidebarOpen ? "Close menu" : "Open menu"}
           >
             ☰
           </button>
+          </div>
         </div>
-        <div className="border-b border-white/5" />
+        <div className="border-b border-[var(--border)]" />
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
+            {/* Chat keeps the panel at viewport height (messages scroll inside it); every other view must let the
+                panel grow with its content, or the opaque surface ends while content keeps going. */}
             <div
-              className="
-                flex min-h-full flex-col rounded-none border border-white/5 bg-black/60
-                shadow-[0_0_0_1px_rgba(255,255,255,0.03),0_10px_30px_rgba(0,0,0,0.5)]
-                backdrop-blur-md md:rounded-xl
-              "
+              className={`
+                flex min-h-full flex-col rounded-none border border-[var(--border)] bg-[var(--surface)]
+                [box-shadow:var(--shadow)]
+                md:rounded-xl
+                ${view === VIEWS.CHAT ? "" : "shrink-0"}
+              `}
             >
               <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col space-y-6 break-words px-4 pt-6 pb-6 sm:px-6 lg:px-8">
         {error && (
@@ -1353,10 +1510,10 @@ ${doc.text.substring(0, 3000)}`
 
         {/* ─── Documents fetch loading ─── */}
         {docsLoading && (
-          <div style={{ ...S.card, textAlign: "center", padding: 24, marginBottom: 12 }}>
-            <p style={{ fontSize: 12, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace" }}>
-              Loading documents...
-            </p>
+          <div role="status" aria-label="Loading documents" style={{ ...S.card, marginBottom: 12 }}>
+            <div className="skeleton" style={{ height: 14, width: "40%", marginBottom: 12 }} />
+            <div className="skeleton" style={{ height: 10, width: "85%", marginBottom: 8 }} />
+            <div className="skeleton" style={{ height: 10, width: "60%" }} />
           </div>
         )}
 
@@ -1366,17 +1523,17 @@ ${doc.text.substring(0, 3000)}`
             <div style={{ maxWidth: 500, margin: "0 auto", textAlign: "center" }}>
               <div style={{ ...S.logoGem, width: 52, height: 52, fontSize: 24, margin: "0 auto 18px", animation: "glow 2s ease infinite" }}>R</div>
               <h3 style={{ fontSize: 16, fontWeight: 700, color: "var(--text-bright)", marginBottom: 6 }}>Processing Pipeline</h3>
-              <p style={{ fontSize: 13, color: "var(--primary)", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 16 }}>{processStep}</p>
+              <p style={{ fontSize: 13, color: "var(--primary)", fontFamily: "var(--font-mono), ui-monospace, monospace", marginBottom: 16 }}>{processStep}</p>
               <div style={S.progressTrack}>
                 <div style={{ ...S.progressFill, width: `${processProgress}%` }} />
               </div>
               <p style={{ fontSize: 11, color: "var(--text)", marginTop: 6 }}>{processProgress}%</p>
               <div style={{ marginTop: 20, background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "12px 14px", textAlign: "left", maxHeight: 180, overflowY: "auto" }}>
-                <div style={{ fontSize: 10, fontWeight: 700, color: "var(--primary)", marginBottom: 8, textTransform: "uppercase", fontFamily: "'IBM Plex Mono', monospace" }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "var(--primary)", marginBottom: 8, textTransform: "uppercase", fontFamily: "var(--font-mono), ui-monospace, monospace" }}>
                   Pipeline Log
                 </div>
                 {processLog.map((l, i) => (
-                  <div key={i} style={{ fontSize: 11, color: l.msg.startsWith("ERROR") ? "var(--danger)" : "var(--text)", marginBottom: 3, fontFamily: "'IBM Plex Mono', monospace", lineHeight: 1.4 }}>
+                  <div key={i} style={{ fontSize: 11, color: l.msg.startsWith("ERROR") ? "var(--danger)" : "var(--text)", marginBottom: 3, fontFamily: "var(--font-mono), ui-monospace, monospace", lineHeight: 1.4 }}>
                     <span style={{ color: "var(--border2)", marginRight: 6 }}>{l.time}</span>{l.msg}
                   </div>
                 ))}
@@ -1387,22 +1544,29 @@ ${doc.text.substring(0, 3000)}`
 
         {/* ═══════ UPLOAD ═══════ */}
         {view === VIEWS.UPLOAD && !processing && (
-          <div className="w-full" style={{ animation: "fadeUp 0.5s ease" }}>
-            <div className="mt-4 mb-6 space-y-4 text-center">
+          <div className="reveal w-full" style={{ ["--d" as string]: "320ms" }}>
+            <div className="reveal hero mt-4 mb-6 space-y-4 text-center" style={{ animation: "none", ["--d" as string]: "0ms" }}>
               <div className="kicker">Document intelligence workspace</div>
-              <h1 className="text-4xl font-semibold tracking-tight text-[var(--text-bright)] sm:text-5xl">
-                Ask your docs. Prove every claim.
+              <h1 className="font-display text-4xl font-medium leading-[1.08] tracking-tight text-[var(--text-bright)] sm:text-6xl">
+                Ask your docs.
+                <br />
+                <em className="accent-italic">Prove every claim.</em>
               </h1>
-              <p className="mx-auto max-w-2xl text-sm text-white/60 sm:text-base">
+              <p className="mx-auto max-w-2xl text-sm text-[var(--text)] sm:text-base">
                 Upload a corpus, run hybrid retrieval, and get streaming answers with clickable citations.
               </p>
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                <span className="chip chip-info">⚡ Hybrid search</span>
+                <span className="chip chip-ok">✓ Cited answers</span>
+                <span className="chip chip-warn">🔒 Private to your account</span>
+              </div>
             </div>
 
             {documentsLoadErrorCard}
 
             {!docsError && !docsLoading && documents.length === 0 && (
-              <div className="mx-auto mb-5 max-w-2xl rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3 text-center">
-                <span className="mono text-[11px] text-white/60">
+              <div className="mx-auto mb-5 max-w-2xl rounded-xl border border-[var(--border)] bg-[var(--panel)] px-4 py-3 text-center">
+                <span className="mono text-[11px] text-[var(--text)]">
                   No documents indexed yet. Drop files to start building your knowledge base.
                 </span>
               </div>
@@ -1419,26 +1583,41 @@ ${doc.text.substring(0, 3000)}`
 
             <div
               className="
-                mx-auto w-full max-w-2xl cursor-pointer
+                dropzone mx-auto w-full max-w-2xl cursor-pointer
                 rounded-2xl p-8 text-center
-                border border-dashed border-white/12
-                bg-gradient-to-b from-white/[0.04] to-white/[0.015]
-                shadow-[0_20px_60px_rgba(0,0,0,0.45)]
+                border border-dashed border-[var(--border)]
+                bg-[var(--surface)]
+                [box-shadow:var(--shadow-lg)]
                 transition duration-200
-                hover:border-white/20
+                hover:border-[var(--border2)]
               "
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={handleDrop}
+              role="button"
+              tabIndex={0}
+              aria-label="Upload documents: drop files here or press Enter to browse"
+              // Highlight via a data attribute (styled in globals.css) rather than React state, so dragging
+              // over the zone doesn't re-render the whole component.
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.currentTarget.dataset.drag = "1";
+              }}
+              onDragLeave={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null)) delete e.currentTarget.dataset.drag;
+              }}
+              onDrop={(e) => {
+                delete e.currentTarget.dataset.drag;
+                handleDrop(e);
+              }}
               onClick={() => fileInputRef.current?.click()}
+              onKeyDown={onActivate(() => fileInputRef.current?.click())}
               style={{ marginBottom: 12 }}
             >
-              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.03] text-[var(--text-bright)] shadow-[0_10px_30px_rgba(0,0,0,0.35)]">
+              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--panel)] text-[var(--text-bright)] [box-shadow:var(--shadow-lg)]">
                 <span className="mono text-sm">KB</span>
               </div>
               <h3 className="text-base font-semibold text-[var(--text-bright)] md:text-lg" style={{ marginBottom: 6 }}>
                 Drop files to index
               </h3>
-              <p className="text-sm text-white/60 md:text-base">
+              <p className="text-sm text-[var(--text)] md:text-base">
                 PDF, TXT, MD, CSV — multiple files supported.
               </p>
               <div style={{ marginTop: 12, display: "flex", justifyContent: "center", gap: 6 }}>
@@ -1447,12 +1626,12 @@ ${doc.text.substring(0, 3000)}`
                     key={t}
                     className="mono"
                     style={{
-                      fontSize: 10,
+                      fontSize: 12,
                       padding: "3px 10px",
                       borderRadius: 999,
-                      background: "rgba(255,255,255,0.03)",
-                      border: "1px solid rgba(255,255,255,0.10)",
-                      color: "rgba(243,246,255,0.78)",
+                      background: "var(--panel)",
+                      border: "1px solid var(--border)",
+                      color: "var(--text)",
                     }}
                   >
                     {t}
@@ -1493,16 +1672,16 @@ ${doc.text.substring(0, 3000)}`
                       min-w-0 flex gap-2
                       p-4
                       rounded-xl
-                      bg-white/[0.03]
-                      border border-white/5
-                      hover:bg-white/[0.06]
+                      bg-[var(--panel)]
+                      border border-[var(--border)]
+                      hover:bg-[var(--panel-hover)]
                       transition
                     "
                   >
                     <span style={{ fontSize: 18 }}>{s.icon}</span>
                     <div className="min-w-0">
                       <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-bright)", marginBottom: 2 }}>{s.title}</div>
-                      <div className="break-words" style={{ fontSize: 10, color: "var(--text)", lineHeight: 1.4 }}>{s.desc}</div>
+                      <div className="break-words" style={{ fontSize: 12, color: "var(--text)", lineHeight: 1.4 }}>{s.desc}</div>
                     </div>
                   </div>
                 ))}
@@ -1516,7 +1695,7 @@ ${doc.text.substring(0, 3000)}`
           <div style={{ animation: "fadeUp 0.4s ease" }}>
             <div style={S.viewHead}>
               <div>
-                <h2 className="text-xl font-extrabold text-[var(--text-bright)] md:text-2xl" style={{ fontFamily: "'IBM Plex Mono', monospace", marginBottom: 3 }}>Knowledge Base</h2>
+                <h2 className="font-display text-2xl font-semibold tracking-tight text-[var(--text-bright)] md:text-3xl" style={{ marginBottom: 3 }}>Knowledge Base</h2>
                 <p className="text-sm text-[var(--text)] md:text-base">
                   {documents.length} documents · {totalChunks} vectors ·{" "}
                   <span style={{ color: dbSynced ? "var(--accent)" : "var(--text)" }}>
@@ -1528,7 +1707,7 @@ ${doc.text.substring(0, 3000)}`
                 <button onClick={() => docFileInputRef.current?.click()} className="hov" style={S.btnPri}>+ Add</button>
                 <input ref={docFileInputRef} type="file" accept=".txt,.md,.csv,.pdf" multiple onChange={handleFileUpload} style={{ display: "none" }} />
                 {documents.length > 0 && (
-                  <button onClick={clearAll} className="hov" style={S.btnDanger}>Clear All + DB</button>
+                  <button onClick={() => setConfirmClearOpen(true)} className="hov" style={S.btnDanger}>Clear All + DB</button>
                 )}
               </div>
             </div>
@@ -1537,33 +1716,53 @@ ${doc.text.substring(0, 3000)}`
               docsError ? (
                 documentsLoadErrorCard
               ) : (
-                <div style={{ ...S.card, textAlign: "center", padding: 50 }}>
-                  <p style={{ fontSize: 14, color: "var(--text)" }}>📂 No documents yet — upload to begin</p>
+                <div style={{ ...S.card, textAlign: "center", padding: "40px 20px" }}>
+                  <div aria-hidden="true" style={{ fontSize: 32, marginBottom: 8 }}>📂</div>
+                  <p style={{ fontSize: 15, fontWeight: 650, color: "var(--text-bright)", marginBottom: 4 }}>No documents yet</p>
+                  <p style={{ fontSize: 13, color: "var(--text)", marginBottom: 16 }}>
+                    Upload a PDF, TXT, MD or CSV, or paste text, to start asking questions.
+                  </p>
+                  <div style={{ display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+                    <button type="button" onClick={() => docFileInputRef.current?.click()} className="hov" style={S.btnPri}>Upload files</button>
+                    <button type="button" onClick={handlePasteText} className="hov btn-ghost">Paste text</button>
+                  </div>
                 </div>
               )
             ) : (
               <div style={{ display: "grid", gap: 10 }}>
                 {documents.map((doc, i) => (
                   <div key={doc.id} style={{ ...S.card, animation: `slideIn 0.3s ease ${i * 0.04}s both` }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                      <div style={{ flex: 1 }}>
-                        <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-bright)", marginBottom: 4 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
+                      <div style={{ flex: "1 1 220px", minWidth: 0 }}>
+                        <h3 style={{ fontSize: 15, fontWeight: 700, color: "var(--text-bright)", marginBottom: 6, overflowWrap: "anywhere" }}>
                           {fileTypeIcon(doc.fileType)} {doc.name}
                           {doc.pages && (
-                            <span style={{ marginLeft: 8, fontSize: 10, color: "var(--accent2)", fontFamily: "'IBM Plex Mono', monospace" }}>
+                            <span style={{ marginLeft: 8, fontSize: 12, color: "var(--accent2)", fontFamily: "var(--font-mono), ui-monospace, monospace" }}>
                               {doc.pages} pages
                             </span>
                           )}
                         </h3>
-                        <div style={{ display: "flex", gap: 10, fontSize: 11, color: "var(--text)", flexWrap: "wrap" }}>
+                        <div style={{ display: "flex", gap: "4px 12px", fontSize: 12, color: "var(--text)", flexWrap: "wrap", alignItems: "center" }}>
                           <span>{doc.charCount.toLocaleString()} chars</span>
-                          <span>·</span>
                           <span>{doc.wordCount.toLocaleString()} words</span>
-                          <span>·</span>
                           <span>{doc.chunks} chunks</span>
-                          <span>·</span>
+                          {doc.status && doc.status !== "indexed" && (
+                            <>
+                                  {doc.status === "failed" ? (
+                                <span className="chip chip-danger">
+                                  failed{doc.error ? ` — ${doc.error}` : ""}{" "}
+                                  <button type="button" className="hov" style={{ textDecoration: "underline", fontWeight: 700 }} onClick={() => retryIngestion(doc.id)}>
+                                    Retry
+                                  </button>
+                                </span>
+                              ) : (
+                                <span className="chip chip-warn">
+                                  embedding {doc.chunksDone ?? 0}/{doc.chunks}…
+                                </span>
+                              )}
+                            </>
+                          )}
                           <span>avg {doc.avgChunkSize} chars/chunk</span>
-                          <span>·</span>
                           <span style={{ color: "var(--text)" }}>{doc.uploadedAt}</span>
                         </div>
                       </div>
@@ -1591,19 +1790,19 @@ ${doc.text.substring(0, 3000)}`
                         </p>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                           {docSummaries[doc.id].topics?.map((t, ti) => (
-                            <span key={ti} style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "var(--primary)" + "18", color: "var(--primary)", fontFamily: "'IBM Plex Mono', monospace" }}>{t}</span>
+                            <span key={ti} style={{ fontSize: 12, padding: "2px 8px", borderRadius: 4, background: "color-mix(in srgb, var(--primary) 9%, transparent)", color: "var(--primary)", fontFamily: "var(--font-mono), ui-monospace, monospace" }}>{t}</span>
                           ))}
-                          <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "var(--accent2)" + "18", color: "var(--accent2)", fontFamily: "'IBM Plex Mono', monospace" }}>
+                          <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 4, background: "color-mix(in srgb, var(--accent2) 9%, transparent)", color: "var(--accent2)", fontFamily: "var(--font-mono), ui-monospace, monospace" }}>
                             {docSummaries[doc.id].complexity}
                           </span>
-                          <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "var(--accent)" + "18", color: "var(--accent)", fontFamily: "'IBM Plex Mono', monospace" }}>
+                          <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 4, background: "color-mix(in srgb, var(--accent) 9%, transparent)", color: "var(--accent)", fontFamily: "var(--font-mono), ui-monospace, monospace" }}>
                             {docSummaries[doc.id].sentiment}
                           </span>
                         </div>
                       </div>
                     )}
 
-                    <div style={{ marginTop: 8, padding: "8px 10px", background: "var(--surface2)", borderRadius: 4, fontSize: 11, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace", maxHeight: 60, overflow: "hidden", lineHeight: 1.5 }}>
+                    <div style={{ marginTop: 8, padding: "8px 10px", background: "var(--surface2)", borderRadius: 4, fontSize: 11, color: "var(--text)", fontFamily: "var(--font-mono), ui-monospace, monospace", maxHeight: 60, overflow: "hidden", lineHeight: 1.5 }}>
                       {doc.text.substring(0, 250)}…
                     </div>
                   </div>
@@ -1621,13 +1820,13 @@ ${doc.text.substring(0, 3000)}`
           >
             <div className="mb-3.5 flex flex-col gap-3 border-b border-[var(--border)] pb-3 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0">
-                <h2 className="text-xl font-extrabold text-[var(--text-bright)] md:text-2xl" style={{ fontFamily: "'IBM Plex Mono', monospace", marginBottom: 3 }}>
+                <h2 className="font-display text-2xl font-semibold tracking-tight text-[var(--text-bright)] md:text-3xl" style={{ marginBottom: 3 }}>
                   Knowledge Q&A
                 </h2>
                 <div className="flex flex-wrap items-center gap-2" style={{ marginTop: 2 }}>
                   <p className="text-sm text-[var(--text)] md:text-base">{documents.length} docs · {totalChunks} chunks</p>
                   <SearchModeBadge mode={useHybridSearch ? "hybrid" : "vector"} />
-                  <span style={{ fontSize: 10, color: "var(--accent)", fontFamily: "'IBM Plex Mono', monospace" }}>⟳ Streaming</span>
+                  <span style={{ fontSize: 12, color: "var(--accent)", fontFamily: "var(--font-mono), ui-monospace, monospace" }}>⟳ Streaming</span>
                 </div>
               </div>
               <div className="flex shrink-0 flex-wrap gap-2">
@@ -1649,17 +1848,17 @@ ${doc.text.substring(0, 3000)}`
                 <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pb-2.5">
                   {chatMessages.length === 0 && (
                     <div className="panel mx-auto w-full max-w-[720px] p-4 sm:p-5">
-                      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex flex-col gap-4">
                         <div className="min-w-0">
                           <div className="kicker">Start a session</div>
                           <div className="mt-1 text-sm font-semibold text-[var(--text-bright)]">
                             Ask a question about your indexed documents
                           </div>
-                          <div className="mt-1 text-xs text-white/55">
+                          <div className="mt-1 text-xs text-[var(--muted)]">
                             Tip: click any <span className="mono">[Source N]</span> pill to open the sources drawer.
                           </div>
                         </div>
-                        <div className="flex gap-2">
+                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                           {[
                             "Summarize the main themes across the documents.",
                             "What are the key risks mentioned? Cite sources.",
@@ -1674,13 +1873,13 @@ ${doc.text.substring(0, 3000)}`
                                 chatInputRef.current?.focus();
                               }}
                               style={{
-                                padding: "8px 10px",
+                                padding: "10px 12px",
                                 borderRadius: 12,
-                                border: "1px solid rgba(255,255,255,0.10)",
-                                background: "rgba(255,255,255,0.02)",
-                                color: "rgba(243,246,255,0.78)",
-                                fontSize: 11,
-                                maxWidth: 220,
+                                border: "1px solid var(--border)",
+                                background: "var(--surface)",
+                                color: "var(--text-bright)",
+                                fontSize: 12,
+                                lineHeight: 1.45,
                                 textAlign: "left",
                               }}
                             >
@@ -1701,24 +1900,24 @@ ${doc.text.substring(0, 3000)}`
                       {msg.role === "user" ? (
                         <div
                           style={{
-                            maxWidth: "72%",
+                            maxWidth: "min(88%, 560px)",
                             padding: "11px 14px",
                             borderRadius: "16px 16px 4px 16px",
                             background:
-                              "linear-gradient(135deg, rgba(125,211,252,0.95), rgba(56,189,248,0.80))",
-                            color: "rgba(8,10,14,0.92)",
-                            boxShadow: "0 18px 50px rgba(0,0,0,0.40)",
+                              "var(--btn-bg)",
+                            color: "var(--btn-fg)",
+                            boxShadow: "var(--shadow)",
                           }}
                         >
                           <p style={{ fontSize: 13, lineHeight: 1.55, fontWeight: 550 }}>{msg.text}</p>
-                          <p className="mono" style={{ fontSize: 9, opacity: 0.7, marginTop: 6, textAlign: "right" }}>
+                          <p className="mono" style={{ fontSize: 11, opacity: 0.7, marginTop: 6, textAlign: "right" }}>
                             {msg.timestamp}
                           </p>
                         </div>
                       ) : msg.streaming ? (
                         /* ─── Streaming message ─── */
-                        <div style={{ maxWidth: "82%", padding: "12px 16px", borderRadius: "16px 16px 16px 4px", background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.10)" }}>
-                          <div className="mono" style={{ fontSize: 10, color: "rgba(125,211,252,0.9)", marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ maxWidth: "min(94%, 680px)", padding: "12px 16px", borderRadius: "16px 16px 16px 4px", background: "var(--panel)", border: "1px solid var(--border)" }}>
+                          <div className="mono" style={{ fontSize: 12, color: "var(--primary-text)", marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
                             <span style={{ animation: "pulse 1s infinite" }}>⟳</span> Generating…
                           </div>
                           <p style={{ fontSize: 13, color: "var(--text-bright)", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
@@ -1728,11 +1927,11 @@ ${doc.text.substring(0, 3000)}`
                         </div>
                       ) : (
                         /* ─── Final assistant message ─── */
-                        <div style={{ maxWidth: "82%", padding: "14px 16px", borderRadius: "16px 16px 16px 4px", background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.10)" }}>
+                        <div style={{ maxWidth: "min(94%, 680px)", padding: "14px 16px", borderRadius: "16px 16px 16px 4px", background: "var(--panel)", border: "1px solid var(--border)" }}>
                           <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
                             <ConfBadge level={msg.confidence} />
                             <SearchModeBadge mode={msg.searchMode} />
-                            <span className="mono" style={{ fontSize: 10, color: "rgba(255,255,255,0.55)" }}>{msg.timestamp}</span>
+                            <span className="mono" style={{ fontSize: 12, color: "var(--muted)" }}>{msg.timestamp}</span>
                           </div>
                           <p style={{ fontSize: 13, color: "var(--text-bright)", lineHeight: 1.8, marginBottom: 10, whiteSpace: "pre-wrap" }}>
                             {renderTextWithCitations(msg.text, (sourceIdx) => {
@@ -1755,7 +1954,7 @@ ${doc.text.substring(0, 3000)}`
                                   padding: "6px 10px",
                                   borderRadius: 999,
                                   border: "1px solid var(--border)",
-                                  background: "rgba(255,255,255,0.02)",
+                                  background: "var(--panel)",
                                   color: "var(--text-bright)",
                                   fontSize: 11,
                                 }}
@@ -1767,13 +1966,13 @@ ${doc.text.substring(0, 3000)}`
                           {msg.keyEntities?.length > 0 && (
                             <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 8 }}>
                               {msg.keyEntities.map((e, ei) => (
-                                <span key={ei} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: "var(--accent)" + "15", color: "var(--accent)", fontFamily: "'IBM Plex Mono', monospace" }}>{e}</span>
+                                <span key={ei} style={{ fontSize: 12, padding: "2px 7px", borderRadius: 4, background: "color-mix(in srgb, var(--accent) 8%, transparent)", color: "var(--accent)", fontFamily: "var(--font-mono), ui-monospace, monospace" }}>{e}</span>
                               ))}
                             </div>
                           )}
                           {msg.followUps?.length > 0 && (
                             <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)" }}>
-                              <p style={{ fontSize: 10, color: "var(--text)", marginBottom: 4, fontFamily: "'IBM Plex Mono', monospace", textTransform: "uppercase" }}>Follow-ups</p>
+                              <p style={{ fontSize: 12, color: "var(--text)", marginBottom: 4, fontFamily: "var(--font-mono), ui-monospace, monospace", textTransform: "uppercase" }}>Follow-ups</p>
                               {msg.followUps.map((q, qi) => (
                                 <button
                                   key={qi}
@@ -1801,7 +2000,7 @@ ${doc.text.substring(0, 3000)}`
                           {[0, 1, 2].map((i) => (
                             <div key={i} style={{ width: 5, height: 5, borderRadius: "50%", background: "var(--primary)", animation: `pulse 1s ease ${i * 0.15}s infinite` }} />
                           ))}
-                          <span style={{ fontSize: 11, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace", marginLeft: 6 }}>
+                          <span style={{ fontSize: 11, color: "var(--text)", fontFamily: "var(--font-mono), ui-monospace, monospace", marginLeft: 6 }}>
                             Embedding → {useHybridSearch ? "BM25+Vector" : "Vector"} search → Streaming…
                           </span>
                         </div>
@@ -1837,16 +2036,15 @@ ${doc.text.substring(0, 3000)}`
               {showRetrieval && (
                 <>
                   <div
-                    className="fixed inset-0 z-[60] bg-black/40"
+                    className="fixed inset-0 z-[60] bg-[var(--overlay)]"
                     aria-hidden="true"
                     onClick={() => setShowRetrieval(false)}
                   />
                   <aside
                     className="
                       fixed right-0 top-0 z-[70] h-full w-[min(420px,92vw)]
-                      border-l border-white/10 bg-[#07080c]/80
-                      shadow-[0_30px_80px_rgba(0,0,0,0.6)]
-                      backdrop-blur-lg
+                      border-l border-[var(--border)] bg-[var(--surface)]
+                      [box-shadow:var(--shadow-lg)]
                     "
                     role="dialog"
                     aria-modal="true"
@@ -1854,15 +2052,15 @@ ${doc.text.substring(0, 3000)}`
                     ref={sourcesDialogRef as unknown as React.RefObject<HTMLElement>}
                   >
                     <div className="flex h-full flex-col">
-                      <div className="flex items-start justify-between gap-3 border-b border-white/10 px-4 py-3">
+                      <div className="flex items-start justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
                         <div className="min-w-0">
-                          <div className="mono text-[10px] uppercase tracking-[0.18em] text-white/60">
+                          <div className="mono text-[11px] uppercase tracking-[0.18em] text-[var(--text)]">
                             Sources · {lastRetrieved.length}
                           </div>
                           <div className="mt-1 text-sm font-semibold text-[var(--text-bright)]">
                             Retrieved chunks
                           </div>
-                          <div className="mt-1 text-xs text-white/50">
+                          <div className="mt-1 text-xs text-[var(--muted)]">
                             {useHybridSearch ? "Hybrid fusion (BM25 + vector → RRF)" : "Vector similarity"}
                           </div>
                         </div>
@@ -1874,9 +2072,9 @@ ${doc.text.substring(0, 3000)}`
                           style={{
                             padding: "8px 10px",
                             borderRadius: 12,
-                            border: "1px solid rgba(255,255,255,0.10)",
-                            background: "rgba(255,255,255,0.02)",
-                            color: "rgba(243,246,255,0.94)",
+                            border: "1px solid var(--border)",
+                            background: "var(--panel)",
+                            color: "var(--text-bright)",
                             fontSize: 11,
                           }}
                         >
@@ -1886,7 +2084,7 @@ ${doc.text.substring(0, 3000)}`
 
                       <div className="flex-1 overflow-y-auto px-3 py-3">
                         {lastRetrieved.length === 0 ? (
-                          <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 text-sm text-white/60">
+                          <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 text-sm text-[var(--text)]">
                             Ask a question to generate sources.
                           </div>
                         ) : (
@@ -1904,27 +2102,38 @@ ${doc.text.substring(0, 3000)}`
                                   textAlign: "left",
                                   padding: "10px 12px",
                                   borderRadius: 16,
-                                  border: "1px solid rgba(255,255,255,0.10)",
+                                  border: "1px solid var(--border)",
                                   background:
                                     i === 0
-                                      ? "linear-gradient(180deg, rgba(125,211,252,0.10), rgba(255,255,255,0.02))"
-                                      : "rgba(255,255,255,0.02)",
-                                  color: "rgba(243,246,255,0.94)",
+                                      ? "linear-gradient(180deg, var(--primary-soft), var(--panel))"
+                                      : "var(--panel)",
+                                  color: "var(--text-bright)",
                                 }}
                               >
                                 <div className="flex items-center justify-between gap-3">
                                   <div className="min-w-0">
-                                    <div className="mono text-[10px] text-white/60">
+                                    <div className="mono text-[11px] text-[var(--text)]">
                                       [Source {i + 1}] · {c.documentName} · #{c.chunkIndex}
                                     </div>
                                   </div>
-                                  <div className="mono text-[10px] text-white/55">
-                                    {useHybridSearch
-                                      ? `vec ${(((c.vectorScore ?? 0) * 100) | 0)} · bm25 ${c.bm25Score?.toFixed(2) ?? "—"}`
-                                      : `${(((c.score ?? 0) * 100) | 0)}%`}
-                                  </div>
+                                  {(() => {
+                                    const v = chunkScore(c);
+                                    const t = scoreTone(v);
+                                    return (
+                                      <div className="flex shrink-0 flex-col items-end gap-1">
+                                        <span className={`chip ${t.chip}`} title="Semantic similarity to your question">
+                                          {t.label} · {(v * 100) | 0}%
+                                        </span>
+                                        {useHybridSearch && (
+                                          <span className="mono text-[11px] text-[var(--muted)]" title="Keyword (full-text) score">
+                                            kw {c.bm25Score?.toFixed(2) ?? "—"}
+                                          </span>
+                                        )}
+                                      </div>
+                                    );
+                                  })()}
                                 </div>
-                                <div className="mt-2 text-xs leading-relaxed text-white/70">
+                                <div className="mt-2 text-xs leading-relaxed text-[var(--text)]">
                                   {c.contentSnippet}
                                 </div>
                               </button>
@@ -1945,7 +2154,7 @@ ${doc.text.substring(0, 3000)}`
           <div style={{ animation: "fadeUp 0.4s ease" }}>
             <div style={S.viewHead}>
               <div>
-                <h2 className="text-xl font-extrabold text-[var(--text-bright)] md:text-2xl" style={{ fontFamily: "'IBM Plex Mono', monospace", marginBottom: 3 }}>Chunk Inspector</h2>
+                <h2 className="font-display text-2xl font-semibold tracking-tight text-[var(--text-bright)] md:text-3xl" style={{ marginBottom: 3 }}>Chunk Inspector</h2>
                 <p className="text-sm text-[var(--text)] md:text-base">Explore and semantically search the vector store · <SearchModeBadge mode={useHybridSearch ? "hybrid" : "vector"} /></p>
               </div>
             </div>
@@ -1991,39 +2200,24 @@ ${doc.text.substring(0, 3000)}`
                     <div key={c.id} style={{
                       padding: "10px 12px", marginBottom: 6,
                       background: "var(--surface2)", borderRadius: 6,
-                      borderLeft: `3px solid ${(c.vectorScore ?? 0) >= 0.6 || (c.score ?? 0) >= 0.6 ? "var(--accent)" : (c.vectorScore ?? 0) >= 0.4 || (c.score ?? 0) >= 0.4 ? "var(--warn)" : "var(--border2)"}`,
+                      borderLeft: `3px solid ${scoreTone(chunkScore(c)).color}`,
                     }}>
                       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
                         <span style={{ fontSize: 11, fontWeight: 600, color: "var(--accent2)" }}>
                           {c.documentName} · Chunk #{c.chunkIndex}
                         </span>
-                        {useHybridSearch ? (
-                          <span style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", color: "var(--text)" }}>
-                            <span style={{ color: "var(--primary)" }}>{((c.vectorScore ?? 0) * 100).toFixed(0)}%</span>
-                            {" + "}
-                            <span style={{ color: "var(--accent2)" }}>{c.bm25Score?.toFixed(2)}</span>
-                          </span>
-                        ) : (
-                          <span
-                            style={{
-                              fontSize: 11,
-                              fontWeight: 800,
-                              fontFamily: "'IBM Plex Mono', monospace",
-                              color:
-                                (c.score ?? 0) >= 0.6
-                                  ? "var(--accent)"
-                                  : (c.score ?? 0) >= 0.4
-                                    ? "var(--warn)"
-                                    : "var(--text)",
-                            }}
-                          >
-                            {((c.score ?? 0) * 100).toFixed(1)}%
-                          </span>
-                        )}
+                        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          {useHybridSearch && (
+                            <span className="mono" style={{ fontSize: 12, color: "var(--muted)" }} title="Keyword (full-text) score">
+                              kw {c.bm25Score?.toFixed(2) ?? "—"}
+                            </span>
+                          )}
+                          <span className={`chip ${scoreTone(chunkScore(c)).chip}`}>{scoreTone(chunkScore(c)).label}</span>
+                        </span>
                       </div>
-                      {!useHybridSearch && <ScoreBar score={c.score ?? 0} />}
-                      <div style={{ marginTop: 6, fontSize: 12, color: "var(--text-bright)", lineHeight: 1.6, fontFamily: "'IBM Plex Mono', monospace" }}>{c.content}</div>
-                      <div style={{ marginTop: 4, fontSize: 10, color: "var(--text)" }}>
+                      <ScoreBar score={chunkScore(c)} />
+                      <div style={{ marginTop: 6, fontSize: 12, color: "var(--text-bright)", lineHeight: 1.6, fontFamily: "var(--font-mono), ui-monospace, monospace" }}>{c.content}</div>
+                      <div style={{ marginTop: 4, fontSize: 12, color: "var(--text)" }}>
                         {c.content.length} chars
                       </div>
                     </div>
@@ -2048,14 +2242,14 @@ ${doc.text.substring(0, 3000)}`
                   >
                     <summary style={{ cursor: "pointer", padding: "8px 10px", background: "var(--surface2)", borderRadius: 4, fontSize: 12, fontWeight: 600, color: "var(--text-bright)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                       <span>{fileTypeIcon(doc.fileType)} {doc.name}</span>
-                      <span style={{ fontSize: 10, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace" }}>{docChunks.length} chunks</span>
+                      <span style={{ fontSize: 12, color: "var(--text)", fontFamily: "var(--font-mono), ui-monospace, monospace" }}>{docChunks.length} chunks</span>
                     </summary>
                     <div style={{ padding: "8px 0" }}>
                       {docChunks.map((c, ci) => (
                         <div
                           key={c.id ?? ci}
                           data-chunk-jump={c.id}
-                          style={{ padding: "6px 10px", marginBottom: 3, borderLeft: "2px solid var(--border)", fontSize: 11, color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace", lineHeight: 1.4 }}
+                          style={{ padding: "6px 10px", marginBottom: 3, borderLeft: "2px solid var(--border)", fontSize: 11, color: "var(--text)", fontFamily: "var(--font-mono), ui-monospace, monospace", lineHeight: 1.4 }}
                         >
                           <span style={{ color: "var(--primary)", fontWeight: 700 }}>#{c.metadata?.chunkIndex}</span>{" "}
                           {c.text.substring(0, 200)}{c.text.length > 200 ? "…" : ""}
@@ -2074,7 +2268,7 @@ ${doc.text.substring(0, 3000)}`
           <div style={{ animation: "fadeUp 0.4s ease" }}>
             <div style={S.viewHead}>
               <div>
-                <h2 className="text-xl font-extrabold text-[var(--text-bright)] md:text-2xl" style={{ fontFamily: "'IBM Plex Mono', monospace", marginBottom: 3 }}>Analytics</h2>
+                <h2 className="font-display text-2xl font-semibold tracking-tight text-[var(--text-bright)] md:text-3xl" style={{ marginBottom: 3 }}>Analytics</h2>
                 <p className="text-sm text-[var(--text)] md:text-base">{queryLog.length} queries logged · {documents.length} documents</p>
               </div>
             </div>
@@ -2092,8 +2286,8 @@ ${doc.text.substring(0, 3000)}`
                 },
               ].map((kpi) => (
                 <div key={kpi.label} style={{ ...S.card, textAlign: "center", marginBottom: 0 }}>
-                  <div style={{ fontSize: 22, fontWeight: 800, color: kpi.color, fontFamily: "'IBM Plex Mono', monospace" }}>{kpi.value}</div>
-                  <div style={{ fontSize: 10, color: "var(--text)", marginTop: 2, textTransform: "uppercase", letterSpacing: "0.05em" }}>{kpi.label}</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: kpi.color, fontFamily: "var(--font-mono), ui-monospace, monospace" }}>{kpi.value}</div>
+                  <div style={{ fontSize: 12, color: "var(--text)", marginTop: 2, textTransform: "uppercase", letterSpacing: "0.05em" }}>{kpi.label}</div>
                 </div>
               ))}
             </div>
@@ -2109,10 +2303,10 @@ ${doc.text.substring(0, 3000)}`
                 ) : (
                   <ResponsiveContainer width="100%" height={160}>
                     <BarChart data={chunkDistribution}>
-                      <XAxis dataKey="name" tick={{ fontSize: 9, fill: "#8B92AB" }} />
-                      <YAxis tick={{ fontSize: 9, fill: "#8B92AB" }} />
-                      <Tooltip contentStyle={{ background: "#0F1118", border: "1px solid #252940", borderRadius: 6, fontSize: 11 }} />
-                      <Bar dataKey="chunks" fill="#7C5CFC" radius={[2, 2, 0, 0]} />
+                      <XAxis dataKey="name" tick={{ fontSize: 11, fill: "var(--muted)" }} />
+                      <YAxis tick={{ fontSize: 11, fill: "var(--muted)" }} />
+                      <Tooltip contentStyle={{ background: "var(--surface)", color: "var(--text-bright)", border: "1px solid var(--border)", borderRadius: 6, fontSize: 11 }} />
+                      <Bar dataKey="chunks" fill="var(--primary)" radius={[2, 2, 0, 0]} />
                     </BarChart>
                   </ResponsiveContainer>
                 )}
@@ -2129,29 +2323,35 @@ ${doc.text.substring(0, 3000)}`
                   ) : (
                     (() => {
                       const confPieData = [
-                        { name: "High", value: queryStats.confCounts.high, fill: "#06D6A0" },
-                        { name: "Medium", value: queryStats.confCounts.medium, fill: "#FFD166" },
-                        { name: "Low", value: queryStats.confCounts.low, fill: "#EF476F" },
+                        { name: "High", value: queryStats.confCounts.high, fill: "var(--accent)" },
+                        { name: "Medium", value: queryStats.confCounts.medium, fill: "var(--warn)" },
+                        { name: "Low", value: queryStats.confCounts.low, fill: "var(--danger)" },
                       ].filter((d) => d.value > 0);
                       return (
+                        <>
                         <ResponsiveContainer width="100%" height={160}>
                           <PieChart>
                             <Pie
                               data={confPieData}
-                              cx="50%" cy="50%" outerRadius={72}
+                              cx="50%" cy="50%" outerRadius={62}
                               dataKey="value"
-                              label={({ name, percent }: { name?: string; percent?: number }) =>
-                                `${name ?? ""} ${percent != null ? (percent * 100).toFixed(0) : "0"}%`
-                              }
-                              labelLine={false}
+                              stroke={confPieData.length > 1 ? "var(--surface)" : "none"}
                             >
                               {confPieData.map((d) => (
                                 <Cell key={d.name} fill={d.fill} />
                               ))}
                             </Pie>
-                            <Tooltip contentStyle={{ background: "#0F1118", border: "1px solid #252940", borderRadius: 6, fontSize: 11 }} />
+                            <Tooltip contentStyle={{ background: "var(--surface)", color: "var(--text-bright)", border: "1px solid var(--border)", borderRadius: 6, fontSize: 11 }} />
                           </PieChart>
                         </ResponsiveContainer>
+                        <div className="mt-2 flex flex-wrap justify-center gap-2">
+                          {confPieData.map((d) => (
+                            <span key={d.name} className="chip" style={{ background: `color-mix(in srgb, ${d.fill} 14%, transparent)`, color: d.fill }}>
+                              {d.name} · {Math.round((d.value / queryStats.total) * 100)}%
+                            </span>
+                          ))}
+                        </div>
+                        </>
                       );
                     })()
                   )
@@ -2173,14 +2373,14 @@ ${doc.text.substring(0, 3000)}`
                   ) : (
                     <ResponsiveContainer width="100%" height={120}>
                       <LineChart data={queryLog.map((q, i) => ({ idx: i + 1, score: parseFloat((q.topScore * 100).toFixed(1)), mode: q.searchMode }))}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#1F2333" />
-                        <XAxis dataKey="idx" tick={{ fontSize: 9, fill: "#8B92AB" }} label={{ value: "Query #", position: "insideBottom", offset: -2, fontSize: 9, fill: "#8B92AB" }} />
-                        <YAxis tick={{ fontSize: 9, fill: "#8B92AB" }} domain={[0, 100]} unit="%" />
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                        <XAxis dataKey="idx" tick={{ fontSize: 11, fill: "var(--muted)" }} label={{ value: "Query #", position: "insideBottom", offset: -2, fontSize: 11, fill: "var(--muted)" }} />
+                        <YAxis tick={{ fontSize: 11, fill: "var(--muted)" }} domain={[0, 100]} unit="%" />
                         <Tooltip
-                          contentStyle={{ background: "#0F1118", border: "1px solid #252940", borderRadius: 6, fontSize: 11 }}
+                          contentStyle={{ background: "var(--surface)", color: "var(--text-bright)", border: "1px solid var(--border)", borderRadius: 6, fontSize: 11 }}
                           formatter={(v) => [v + "%", "Top Score"]}
                         />
-                        <Line type="monotone" dataKey="score" stroke="#06D6A0" strokeWidth={2} dot={{ r: 3, fill: "#06D6A0" }} />
+                        <Line type="monotone" dataKey="score" stroke="var(--accent)" strokeWidth={2} dot={{ r: 3, fill: "var(--accent)" }} />
                       </LineChart>
                     </ResponsiveContainer>
                   )}
@@ -2197,20 +2397,20 @@ ${doc.text.substring(0, 3000)}`
                     <thead>
                       <tr>
                         {["#", "Question", "Mode", "Confidence", "Top Score", "Sources", "Time"].map((h) => (
-                          <th key={h} style={{ padding: "6px 8px", textAlign: "left", color: "var(--text)", fontWeight: 700, fontSize: 10, textTransform: "uppercase", fontFamily: "'IBM Plex Mono', monospace", borderBottom: "1px solid var(--border)" }}>{h}</th>
+                          <th key={h} style={{ padding: "6px 8px", textAlign: "left", color: "var(--text)", fontWeight: 700, fontSize: 12, textTransform: "uppercase", fontFamily: "var(--font-mono), ui-monospace, monospace", borderBottom: "1px solid var(--border)" }}>{h}</th>
                         ))}
                       </tr>
                     </thead>
                     <tbody>
                       {queryLog.map((q, i) => (
-                        <tr key={i} style={{ borderBottom: "1px solid var(--border)" + "55" }}>
-                          <td style={{ padding: "6px 8px", color: "var(--text)", fontFamily: "'IBM Plex Mono', monospace" }}>{i + 1}</td>
+                        <tr key={i} style={{ borderBottom: "1px solid var(--border)" }}>
+                          <td style={{ padding: "6px 8px", color: "var(--text)", fontFamily: "var(--font-mono), ui-monospace, monospace" }}>{i + 1}</td>
                           <td style={{ padding: "6px 8px", color: "var(--text-bright)", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{q.question}</td>
                           <td style={{ padding: "6px 8px" }}><SearchModeBadge mode={q.searchMode} /></td>
                           <td style={{ padding: "6px 8px" }}><ConfBadge level={q.confidence} /></td>
-                          <td style={{ padding: "6px 8px", fontFamily: "'IBM Plex Mono', monospace", color: "var(--accent)" }}>{(q.topScore * 100).toFixed(1)}%</td>
-                          <td style={{ padding: "6px 8px", fontFamily: "'IBM Plex Mono', monospace", color: "var(--text)" }}>{q.sourcesUsed}</td>
-                          <td style={{ padding: "6px 8px", color: "var(--text)", fontSize: 10 }}>{q.timestamp}</td>
+                          <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono), ui-monospace, monospace", color: "var(--accent)" }}>{(q.topScore * 100).toFixed(1)}%</td>
+                          <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono), ui-monospace, monospace", color: "var(--text)" }}>{q.sourcesUsed}</td>
+                          <td style={{ padding: "6px 8px", color: "var(--text)", fontSize: 12 }}>{q.timestamp}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -2226,7 +2426,7 @@ ${doc.text.substring(0, 3000)}`
           <div style={{ animation: "fadeUp 0.4s ease" }}>
             <div style={S.viewHead}>
               <div>
-                <h2 className="text-xl font-extrabold text-[var(--text-bright)] md:text-2xl" style={{ fontFamily: "'IBM Plex Mono', monospace", marginBottom: 3 }}>Pipeline Config</h2>
+                <h2 className="font-display text-2xl font-semibold tracking-tight text-[var(--text-bright)] md:text-3xl" style={{ marginBottom: 3 }}>Pipeline Config</h2>
                 <p className="text-sm text-[var(--text)] md:text-base">Tune chunking, retrieval, and search strategy</p>
               </div>
             </div>
@@ -2248,7 +2448,7 @@ ${doc.text.substring(0, 3000)}`
                     onChange={(e) => setChunkOverlap(Number(e.target.value))} style={{ width: "100%", accentColor: "var(--primary)" }} />
                   <div style={S.cfgVal}>{chunkOverlap}</div>
                 </div>
-                <div style={{ marginTop: 10, padding: "8px", background: "var(--surface2)", borderRadius: 4, fontSize: 10, color: "var(--text)", lineHeight: 1.5 }}>
+                <div style={{ marginTop: 10, padding: "8px", background: "var(--surface2)", borderRadius: 4, fontSize: 12, color: "var(--text)", lineHeight: 1.5 }}>
                   Smaller chunks = precise retrieval, less context. Larger = more context, may dilute relevance.
                 </div>
               </div>
@@ -2267,15 +2467,15 @@ ${doc.text.substring(0, 3000)}`
                     onChange={(e) => setSimilarityThreshold(Number(e.target.value))} style={{ width: "100%", accentColor: "var(--accent)" }} />
                   <div style={S.cfgVal}>{similarityThreshold.toFixed(2)}</div>
                 </div>
-                <div style={{ padding: "8px", background: "var(--surface2)", borderRadius: 4, fontSize: 10, color: "var(--text)", lineHeight: 1.5 }}>
+                <div style={{ padding: "8px", background: "var(--surface2)", borderRadius: 4, fontSize: 12, color: "var(--text)", lineHeight: 1.5 }}>
                   Applied to vector score. Chunks below threshold excluded even in hybrid mode.
                 </div>
               </div>
 
               {/* NEW: Search Strategy card */}
-              <div style={{ ...S.card, gridColumn: "1 / -1", borderColor: "var(--accent2)" + "33" }}>
+              <div style={{ ...S.card, gridColumn: "1 / -1", borderColor: "color-mix(in srgb, var(--accent2) 20%, transparent)" }}>
                 <h3 style={{ ...S.cardTitle, color: "var(--accent2)" }}>⚡ Search Strategy</h3>
-                <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+                <div role="radiogroup" aria-label="Search strategy" className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
                   {[
                     {
                       label: "Hybrid (BM25 + Vector)",
@@ -2292,11 +2492,15 @@ ${doc.text.substring(0, 3000)}`
                   ].map((opt) => (
                     <div
                       key={opt.label}
+                      role="radio"
+                      aria-checked={useHybridSearch === opt.value}
+                      tabIndex={0}
                       onClick={() => setUseHybridSearch(opt.value)}
+                      onKeyDown={onActivate(() => setUseHybridSearch(opt.value))}
                       style={{
-                        padding: 12, borderRadius: 6, cursor: "pointer",
+                        padding: 12, borderRadius: 10, cursor: "pointer",
                         border: `1px solid ${useHybridSearch === opt.value ? "var(--accent2)" : "var(--border)"}`,
-                        background: useHybridSearch === opt.value ? "var(--accent2)" + "08" : "var(--surface2)",
+                        background: useHybridSearch === opt.value ? "color-mix(in srgb, var(--accent2) 9%, transparent)" : "var(--surface2)",
                         transition: "all 0.2s ease",
                       }}
                     >
@@ -2310,12 +2514,12 @@ ${doc.text.substring(0, 3000)}`
                         <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-bright)" }}>{opt.label}</span>
                       </div>
                       <p style={{ fontSize: 11, color: "var(--text)", lineHeight: 1.5, marginBottom: 6 }}>{opt.desc}</p>
-                      <span style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", color: "var(--accent2)" }}>{opt.best}</span>
+                      <span style={{ fontSize: 12, fontFamily: "var(--font-mono), ui-monospace, monospace", color: "var(--accent2)" }}>{opt.best}</span>
                     </div>
                   ))}
                 </div>
                 {/* RRF explanation */}
-                <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--surface2)", borderRadius: 4, fontSize: 10, color: "var(--text)", lineHeight: 1.6, fontFamily: "'IBM Plex Mono', monospace" }}>
+                <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--surface2)", borderRadius: 4, fontSize: 12, color: "var(--text)", lineHeight: 1.6, fontFamily: "var(--font-mono), ui-monospace, monospace" }}>
                   <span style={{ color: "var(--accent2)", fontWeight: 700 }}>RRF formula:</span>{" "}
                   score(d) = Σ 1/(k + rank_i(d)) where k=60 — ranks are fused across BM25 and vector rankings.
                   This is the same approach used by Elasticsearch&apos;s hybrid search.
@@ -2343,11 +2547,15 @@ ${doc.text.substring(0, 3000)}`
                     ].map((opt) => (
                       <div
                         key={opt.label}
+                        role="checkbox"
+                        aria-checked={opt.checked}
+                        tabIndex={0}
                         onClick={opt.toggle}
+                        onKeyDown={onActivate(opt.toggle)}
                         style={{
-                          padding: 12, borderRadius: 6, cursor: "pointer",
+                          padding: 12, borderRadius: 10, cursor: "pointer",
                           border: `1px solid ${opt.checked ? "var(--accent)" : "var(--border)"}`,
-                          background: opt.checked ? "var(--accent)" + "08" : "var(--surface2)",
+                          background: opt.checked ? "color-mix(in srgb, var(--accent) 9%, transparent)" : "var(--surface2)",
                           transition: "all 0.2s ease",
                         }}
                       >
@@ -2361,7 +2569,7 @@ ${doc.text.substring(0, 3000)}`
                           <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-bright)" }}>{opt.label}</span>
                         </div>
                         <p style={{ fontSize: 11, color: "var(--text)", lineHeight: 1.5, marginBottom: 6 }}>{opt.desc}</p>
-                        <span style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", color: "var(--accent)" }}>{opt.best}</span>
+                        <span style={{ fontSize: 12, fontFamily: "var(--font-mono), ui-monospace, monospace", color: "var(--accent)" }}>{opt.best}</span>
                       </div>
                     ))}
                   </div>
@@ -2378,7 +2586,7 @@ ${doc.text.substring(0, 3000)}`
                 ].map(([k, v, c]) => (
                   <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid var(--border)", fontSize: 12 }}>
                     <span style={{ color: "var(--text)" }}>{k}</span>
-                    <span style={{ color: c, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600 }}>{v}</span>
+                    <span style={{ color: c, fontFamily: "var(--font-mono), ui-monospace, monospace", fontWeight: 600 }}>{v}</span>
                   </div>
                 ))}
               </div>
@@ -2388,13 +2596,13 @@ ${doc.text.substring(0, 3000)}`
                 {[
                   ["Endpoint", "POST /api/chat", "var(--primary)"],
                   ["Body", "{ prompt }", "var(--accent)"],
-                  ["UI", "Simulated stream", "var(--accent2)"],
+                  ["UI", "Live token stream", "var(--accent2)"],
                   ["Secrets", "Server only", "var(--warn)"],
                   ["Features", "Citations, Entities, Follow-ups", "var(--text)"],
                 ].map(([k, v, c]) => (
                   <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid var(--border)", fontSize: 12 }}>
                     <span style={{ color: "var(--text)" }}>{k}</span>
-                    <span style={{ color: c, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600 }}>{v}</span>
+                    <span style={{ color: c, fontFamily: "var(--font-mono), ui-monospace, monospace", fontWeight: 600 }}>{v}</span>
                   </div>
                 ))}
               </div>
@@ -2403,24 +2611,24 @@ ${doc.text.substring(0, 3000)}`
                 <h3 style={S.cardTitle}>🗄️ Persistence</h3>
                 {[
                   ["Storage", "Supabase", "var(--primary)"],
-                  ["Scope", "Browser origin", "var(--accent)"],
+                  ["Scope", "Your account (RLS)", "var(--accent)"],
                   ["Documents", `${documents.length} saved`, "var(--accent2)"],
                   ["Vectors", `${totalChunks} embeddings`, "var(--warn)"],
                   ["Status", dbSynced ? "✓ Synced" : "Not saved", dbSynced ? "var(--accent)" : "var(--text)"],
                 ].map(([k, v, c]) => (
                   <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid var(--border)", fontSize: 12 }}>
                     <span style={{ color: "var(--text)" }}>{k}</span>
-                    <span style={{ color: c, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600 }}>{v}</span>
+                    <span style={{ color: c, fontFamily: "var(--font-mono), ui-monospace, monospace", fontWeight: 600 }}>{v}</span>
                   </div>
                 ))}
-                <button onClick={clearAll} className="hov" style={{ ...S.btnDanger, width: "100%", marginTop: 10, textAlign: "center" }}>
+                <button onClick={() => setConfirmClearOpen(true)} className="hov" style={{ ...S.btnDanger, width: "100%", marginTop: 10, textAlign: "center" }}>
                   Clear All + Wipe Supabase
                 </button>
               </div>
 
-              <div style={{ ...S.card, gridColumn: "1 / -1", borderColor: "var(--primary)" + "33" }}>
+              <div style={{ ...S.card, gridColumn: "1 / -1", borderColor: "color-mix(in srgb, var(--primary) 20%, transparent)" }}>
                 <h3 style={S.cardTitle}>📐 Pipeline Flow</h3>
-                <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "var(--text)", lineHeight: 2.4, padding: "8px 0" }}>
+                <div style={{ fontFamily: "var(--font-mono), ui-monospace, monospace", fontSize: 11, color: "var(--text)", lineHeight: 2.4, padding: "8px 0" }}>
                   <span style={{ color: "var(--accent2)" }}>PDF/TXT/MD/CSV</span>{" → "}
                   <span style={{ color: "var(--primary)" }}>Sentence Chunker</span>{" → "}
                   <span style={{ color: "var(--accent)" }}>Batch Embeddings (768d)</span>{" → "}
@@ -2438,12 +2646,13 @@ ${doc.text.substring(0, 3000)}`
 
             </div>
           <footer
-            className="
-              border-t border-white/10
-              bg-black/30
+            className={`
+              ${view === VIEWS.CHAT ? "hidden md:block" : ""}
+              border-t border-[var(--border)]
+              bg-[var(--surface2)]
               px-6 py-3
-              text-center text-xs text-white/50
-            "
+              text-center text-xs text-[var(--muted)]
+            `}
           >
             Built by Prasanna Warad · RAGBase · Backend /api/embed + /api/chat + /api/retrieve · Hybrid BM25+Vector · Supabase pgvector
           </footer>
@@ -2451,7 +2660,61 @@ ${doc.text.substring(0, 3000)}`
           </div>
         </div>
       </div>
+
+      {pasteOpen && <PasteDialog onSubmit={submitPastedText} onClose={() => setPasteOpen(false)} />}
+
+      <Dialog
+        open={confirmClearOpen}
+        title="Clear everything?"
+        description="This permanently deletes all your documents and chunks from Supabase. It cannot be undone."
+        onClose={() => setConfirmClearOpen(false)}
+        actions={
+          <>
+            <button type="button" className="hov btn-ghost" onClick={() => setConfirmClearOpen(false)}>
+              Cancel
+            </button>
+            <button type="button" className="hov" style={S.btnDanger} onClick={clearAll}>
+              Yes, delete all
+            </button>
+          </>
+        }
+      />
     </div>
+  );
+}
+
+/** Owns the paste form's state so typing re-renders only this dialog, not the whole RAGBase tree. Mounted only while open, so it starts empty each time. */
+function PasteDialog({ onSubmit, onClose }: { onSubmit: (name: string, text: string) => void; onClose: () => void }) {
+  const [name, setName] = useState("");
+  const [text, setText] = useState("");
+  const canSubmit = text.trim().length > 0;
+  return (
+    <Dialog
+      open
+      title="Paste text"
+      description="Add text straight to your knowledge base. It is chunked and embedded like an uploaded file."
+      onClose={onClose}
+      actions={
+        <>
+          <button type="button" className="hov btn-ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="button" className="hov btn-pri" disabled={!canSubmit} style={{ opacity: canSubmit ? 1 : 0.5 }} onClick={() => onSubmit(name.trim(), text.trim())}>
+            Add to knowledge base
+          </button>
+        </>
+      }
+    >
+      <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name (optional)" aria-label="Document name" style={S.input} />
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Paste your document text here…"
+        aria-label="Document text"
+        rows={8}
+        style={{ ...S.input, resize: "vertical", minHeight: 140, lineHeight: 1.5 }}
+      />
+    </Dialog>
   );
 }
 
@@ -2459,25 +2722,25 @@ ${doc.text.substring(0, 3000)}`
 const S: Record<string, CSSProperties> = {
   sidebarTop: { padding: "16px 14px", borderBottom: "1px solid var(--border)" },
   logoRow: { display: "flex", alignItems: "center", gap: 8 },
-  logoGem: { width: 30, height: 30, borderRadius: 8, background: "linear-gradient(135deg, rgba(125,211,252,0.95), rgba(56,189,248,0.85))", display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(8,10,14,0.92)", fontWeight: 850, fontSize: 14, fontFamily: "'JetBrains Mono', ui-monospace, monospace" },
-  logoTitle: { fontFamily: "'JetBrains Mono', ui-monospace, monospace", fontSize: 13, fontWeight: 800, color: "var(--text-bright)", letterSpacing: "-0.01em" },
-  logoSub: { fontSize: 9, color: "var(--text)" },
+  logoGem: { width: 30, height: 30, borderRadius: 8, background: "var(--btn-bg)", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--btn-fg)", fontWeight: 850, fontSize: 14, fontFamily: "var(--font-mono), ui-monospace, monospace" },
+  logoTitle: { fontFamily: "var(--font-display), Georgia, serif", fontSize: 16, fontWeight: 600, color: "var(--text-bright)", letterSpacing: "-0.01em" },
+  logoSub: { fontSize: 11, color: "var(--text)" },
   sidebarNav: { padding: "10px 6px" },
-  navItem: { width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "9px 10px", borderRadius: 8, background: "transparent", border: "none", fontFamily: "'Outfit', system-ui, sans-serif", fontWeight: 600, color: "var(--text-bright)", cursor: "pointer", marginBottom: 2, textAlign: "left" },
-  badge: { fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 999, background: "rgba(125,211,252,0.12)", color: "rgba(125,211,252,0.95)", fontFamily: "'JetBrains Mono', ui-monospace, monospace", fontVariantNumeric: "tabular-nums" },
+  navItem: { width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "9px 10px", borderRadius: 8, background: "transparent", border: "none", fontFamily: "var(--font-sans), system-ui, sans-serif", fontWeight: 600, color: "var(--text-bright)", cursor: "pointer", marginBottom: 2, textAlign: "left" },
+  badge: { fontSize: 11, fontWeight: 700, padding: "1px 6px", borderRadius: 999, background: "var(--primary-soft)", color: "var(--primary-text)", fontFamily: "var(--font-mono), ui-monospace, monospace", fontVariantNumeric: "tabular-nums" },
   statItem: { display: "flex", flexDirection: "column", alignItems: "center", gap: 2 },
   sidebarFoot: { padding: "10px 6px", borderTop: "1px solid var(--border)" },
-  input: { width: "100%", padding: "9px 12px", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 10, color: "var(--text-bright)", fontSize: 12, fontFamily: "'Outfit', system-ui, sans-serif" },
-  selectInput: { padding: "9px 10px", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 10, color: "var(--text-bright)", fontSize: 12, fontFamily: "'JetBrains Mono', ui-monospace, monospace", minWidth: 140, fontVariantNumeric: "tabular-nums" },
-  btnPri: { padding: "9px 16px", background: "linear-gradient(135deg, rgba(125,211,252,0.95), rgba(56,189,248,0.85))", border: "1px solid rgba(255,255,255,0.10)", borderRadius: 12, color: "rgba(8,10,14,0.92)", fontSize: 12, fontWeight: 800, fontFamily: "'Outfit', system-ui, sans-serif", cursor: "pointer", whiteSpace: "nowrap", boxShadow: "0 10px 30px rgba(0,0,0,0.35)" },
-  btnOut: { padding: "9px 14px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)", borderRadius: 12, color: "var(--text-bright)", fontSize: 12, fontWeight: 650, fontFamily: "'Outfit', system-ui, sans-serif", cursor: "pointer" },
-  btnDanger: { padding: "9px 14px", background: "rgba(251,113,133,0.10)", border: "1px solid rgba(251,113,133,0.22)", borderRadius: 12, color: "rgba(251,113,133,0.95)", fontSize: 11, fontWeight: 750, fontFamily: "'Outfit', system-ui, sans-serif", cursor: "pointer" },
-  errorBar: { display: "flex", alignItems: "center", gap: 8, background: "var(--danger)" + "10", border: "1px solid var(--danger)" + "33", borderRadius: 6, padding: "8px 14px", marginBottom: 12, fontSize: 12, color: "var(--danger)" },
-  card: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: "16px 18px", marginBottom: 10, boxShadow: "0 12px 40px rgba(0,0,0,0.35)" },
-  cardTitle: { fontSize: 11, fontWeight: 750, color: "rgba(125,211,252,0.90)", textTransform: "uppercase", letterSpacing: "0.08em", fontFamily: "'JetBrains Mono', ui-monospace, monospace", marginBottom: 12 },
+  input: { width: "100%", padding: "9px 12px", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 10, color: "var(--text-bright)", fontSize: 12, fontFamily: "var(--font-sans), system-ui, sans-serif" },
+  selectInput: { padding: "9px 10px", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 10, color: "var(--text-bright)", fontSize: 12, fontFamily: "var(--font-mono), ui-monospace, monospace", minWidth: 140, fontVariantNumeric: "tabular-nums" },
+  btnPri: { padding: "9px 16px", background: "var(--btn-bg)", border: "1px solid var(--border)", borderRadius: 12, color: "var(--btn-fg)", fontSize: 12, fontWeight: 800, fontFamily: "var(--font-sans), system-ui, sans-serif", cursor: "pointer", whiteSpace: "nowrap", boxShadow: "var(--shadow)" },
+  btnOut: { padding: "9px 14px", background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 12, color: "var(--text-bright)", fontSize: 12, fontWeight: 650, fontFamily: "var(--font-sans), system-ui, sans-serif", cursor: "pointer" },
+  btnDanger: { padding: "9px 14px", background: "var(--danger-bg)", border: "1px solid color-mix(in srgb, var(--danger) 25%, transparent)", borderRadius: 12, color: "var(--danger)", fontSize: 11, fontWeight: 750, fontFamily: "var(--font-sans), system-ui, sans-serif", cursor: "pointer" },
+  errorBar: { display: "flex", alignItems: "center", gap: 8, background: "color-mix(in srgb, var(--danger) 6%, transparent)", border: "1px solid color-mix(in srgb, var(--danger) 20%, transparent)", borderRadius: 6, padding: "8px 14px", marginBottom: 12, fontSize: 12, color: "var(--danger)" },
+  card: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: "16px 18px", marginBottom: 10, boxShadow: "var(--shadow)" },
+  cardTitle: { fontSize: 11, fontWeight: 750, color: "var(--primary-text)", textTransform: "uppercase", letterSpacing: "0.08em", fontFamily: "var(--font-mono), ui-monospace, monospace", marginBottom: 12 },
   viewHead: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16, flexWrap: "wrap", gap: 10 },
   progressTrack: { height: 4, background: "var(--surface3)", borderRadius: 2, overflow: "hidden", width: "100%" },
   progressFill: { height: "100%", borderRadius: 2, background: "linear-gradient(90deg, var(--primary), var(--accent))", transition: "width 0.5s ease", animation: "progressPulse 1.5s ease infinite" },
-  cfgLabel: { display: "block", fontSize: 10, fontWeight: 700, color: "var(--text)", textTransform: "uppercase", letterSpacing: "0.08em", fontFamily: "'JetBrains Mono', ui-monospace, monospace", marginBottom: 4 },
-  cfgVal: { textAlign: "right", fontSize: 13, fontWeight: 850, color: "rgba(125,211,252,0.95)", fontFamily: "'JetBrains Mono', ui-monospace, monospace", marginTop: 2, fontVariantNumeric: "tabular-nums" },
+  cfgLabel: { display: "block", fontSize: 12, fontWeight: 700, color: "var(--text)", textTransform: "uppercase", letterSpacing: "0.08em", fontFamily: "var(--font-mono), ui-monospace, monospace", marginBottom: 4 },
+  cfgVal: { textAlign: "right", fontSize: 13, fontWeight: 850, color: "var(--primary-text)", fontFamily: "var(--font-mono), ui-monospace, monospace", marginTop: 2, fontVariantNumeric: "tabular-nums" },
 };

@@ -1,50 +1,54 @@
 import { NextResponse } from "next/server";
-import {
-  hybridSearchDb,
-  vectorSearch,
-  vectorSearchFiltered,
-} from "@/lib/search";
+import { hybridSearchDb, vectorSearch } from "@/lib/search";
 import { vectorDocsToRetrievalResults } from "@/lib/vectorDocsToRetrieval";
-import { embedTexts } from "@/lib/gemini";
+import { embedQueryCached } from "@/lib/embedCache";
+import { cacheGet, cacheSet, getUserCacheVersion } from "@/lib/cache";
+import {
+  RETRIEVAL_TTL_SECONDS,
+  retrievalCacheKey,
+  wantsFreshResults,
+  type CachedRetrieval,
+} from "@/lib/retrievalCache";
 import { mockEmbeddingsForTexts } from "@/lib/embedFallback";
-import { isSupabaseConfigured } from "@/lib/supabase/server";
+import { requireUser } from "@/lib/auth";
 import { startTrace, flushTraces } from "@/lib/observability";
 import { rewriteQuery } from "@/lib/queryRewrite";
 import { rerankDocs, rerankCandidateCount } from "@/lib/rerank";
+import { guardRequest, guardUser } from "@/lib/apiGuard";
+import { apiError, parseBody } from "@/lib/api/http";
+import { retrieveSchema } from "@/lib/api/schemas";
 
 export async function POST(req: Request) {
-  if (!isSupabaseConfigured()) {
-    return NextResponse.json(
-      {
-        error:
-          "Supabase is not configured (set SUPABASE_SERVICE_ROLE_KEY and SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL)",
-      },
-      { status: 503 }
-    );
-  }
+  const blocked = await guardRequest(req, { name: "retrieve", limit: 30 });
+  if (blocked) return blocked;
+  const auth = await requireUser(req);
+  if (!auth.ok) return auth.response;
+  const { supabase, user } = auth;
+  const perUser = await guardUser(user.id, { name: "retrieve", limit: 30 });
+  if (perUser) return perUser;
 
-  let body: Record<string, unknown>;
-  try {
-    body = (await req.json()) as Record<string, unknown>;
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
-  }
+  const parsed = await parseBody(req, retrieveSchema);
+  if (!parsed.ok) return parsed.response;
+  const { query } = parsed.data;
+  const topK = parsed.data.topK ?? 5;
+  const useHybrid = parsed.data.useHybrid ?? false;
+  const useRerank = parsed.data.rerank ?? false;
+  const useRewrite = parsed.data.rewrite ?? false;
+  const filterDocumentId = parsed.data.filterDocumentId ?? null;
 
-  const query = typeof body.query === "string" ? body.query.trim() : "";
-  const topK = typeof body.topK === "number" && body.topK > 0 ? body.topK : 5;
-  const useHybrid = Boolean(body.useHybrid);
-  const useRerank = Boolean(body.rerank);
-  const useRewrite = Boolean(body.rewrite);
-  const filterDocumentId =
-    typeof body.filterDocumentId === "string" && body.filterDocumentId.length > 0
-      ? body.filterDocumentId
-      : null;
-
-  if (!query) {
-    return NextResponse.json(
-      { error: "Expected body: { query: string, topK?: number, useHybrid?: boolean, rerank?: boolean, rewrite?: boolean, filterDocumentId?: string }" },
-      { status: 400 }
-    );
+  // Cache lookup comes before tracing/embedding/LLM work: a hit costs two Redis reads.
+  const fresh = wantsFreshResults(req);
+  const cacheKey = retrievalCacheKey(user.id, await getUserCacheVersion(user.id), {
+    query,
+    topK,
+    useHybrid,
+    rerank: useRerank,
+    rewrite: useRewrite,
+    filterDocumentId,
+  });
+  if (!fresh) {
+    const hit = await cacheGet<CachedRetrieval>(cacheKey);
+    if (hit) return NextResponse.json(hit, { headers: { "X-Cache": "HIT" } });
   }
 
   const trace = startTrace("retrieve", {
@@ -65,21 +69,23 @@ export async function POST(req: Request) {
     }
 
     const embedSpan = trace?.span({ name: "embed-query", input: { query: searchQuery } });
-    let embeddings: number[][];
+    let queryEmbedding: number[] | undefined;
     let embeddingSource = "gemini/gemini-embedding-001";
+    let embeddingCached = false;
     try {
-      embeddings = await embedTexts([searchQuery]);
+      const r = await embedQueryCached(searchQuery);
+      queryEmbedding = r.embedding;
+      embeddingCached = r.cached;
     } catch {
-      embeddings = mockEmbeddingsForTexts([searchQuery]);
+      [queryEmbedding] = mockEmbeddingsForTexts([searchQuery]);
       embeddingSource = "mock-fallback";
     }
-    embedSpan?.end({ output: { embeddingSource, dims: embeddings[0]?.length ?? 0 } });
+    embedSpan?.end({ output: { embeddingSource, embeddingCached, dims: queryEmbedding?.length ?? 0 } });
 
-    const [queryEmbedding] = embeddings;
     if (!queryEmbedding?.length) {
       trace?.update({ output: { error: "Failed to build query embedding" } });
       await flushTraces();
-      return NextResponse.json({ error: "Failed to build query embedding" }, { status: 500 });
+      return apiError(500, "internal_error", "Failed to build query embedding");
     }
 
     const fetchK = useRerank ? rerankCandidateCount(topK) : topK;
@@ -89,11 +95,9 @@ export async function POST(req: Request) {
     });
     let raw;
     if (useHybrid) {
-      raw = await hybridSearchDb(searchQuery, queryEmbedding, fetchK, filterDocumentId);
-    } else if (filterDocumentId) {
-      raw = await vectorSearchFiltered(queryEmbedding, fetchK, filterDocumentId);
+      raw = await hybridSearchDb(supabase, searchQuery, queryEmbedding, fetchK, filterDocumentId);
     } else {
-      raw = await vectorSearch(queryEmbedding, fetchK);
+      raw = await vectorSearch(supabase, queryEmbedding, fetchK, filterDocumentId);
     }
     searchSpan?.end({ output: { candidates: raw.length } });
 
@@ -107,7 +111,7 @@ export async function POST(req: Request) {
       rerankSpan?.end({ output: raw.map((d) => ({ id: d.id, chunkIndex: d.metadata.chunkIndex })) });
     }
 
-    const results = await vectorDocsToRetrievalResults(raw);
+    const results = await vectorDocsToRetrievalResults(supabase, raw);
     trace?.update({
       output: {
         resultCount: results.length,
@@ -121,17 +125,20 @@ export async function POST(req: Request) {
       },
     });
     await flushTraces();
-    return NextResponse.json({
+    const payload: CachedRetrieval = {
       results,
       ...(useRewrite && searchQuery !== query ? { rewrittenQuery: searchQuery } : {}),
-    });
+    };
+    // Never cache a response built from the mock-embedding fallback: it is near-random and
+    // would stay wrong for the whole TTL after Gemini recovers.
+    if (embeddingSource !== "mock-fallback") {
+      await cacheSet(cacheKey, payload, RETRIEVAL_TTL_SECONDS);
+    }
+    return NextResponse.json(payload, { headers: { "X-Cache": fresh ? "BYPASS" : "MISS" } });
   } catch (e) {
     console.error("[api/retrieve]", e);
     trace?.update({ output: { error: e instanceof Error ? e.message : String(e) } });
     await flushTraces();
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : String(e) },
-      { status: 500 }
-    );
+    return apiError(500, "internal_error", "Retrieval failed");
   }
 }

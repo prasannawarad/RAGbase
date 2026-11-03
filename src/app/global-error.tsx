@@ -16,10 +16,10 @@ export default function GlobalError({
 
   return (
     <html lang="en">
-      <body style={{ margin: 0, background: "#08090E", color: "#E4E7F0", fontFamily: "system-ui, sans-serif" }}>
-        <div style={{ padding: 24, minHeight: "100vh" }}>
+      <body style={{ margin: 0, background: "#09090b", color: "#f4f4f5", fontFamily: "system-ui, sans-serif" }}>
+        <div style={{ padding: 24, minHeight: "100dvh" }}>
           <h2>Application error</h2>
-          <pre style={{ color: "#EF476F", whiteSpace: "pre-wrap" }}>{error.message}</pre>
+          <pre style={{ color: "#fb7185", whiteSpace: "pre-wrap" }}>{error.message}</pre>
           <button type="button" onClick={reset} style={{ marginTop: 16, padding: "8px 16px", cursor: "pointer" }}>
             Try again
           </button>

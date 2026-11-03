@@ -7,7 +7,10 @@ tweaks) to know whether the change actually helped.
 ## Setup
 
 1. Start the app: `npm run dev` (the harness calls the live API routes).
-2. Ingest your documents through the UI.
+2. Create a dedicated eval account (sign up in the UI), set `EVAL_EMAIL` / `EVAL_PASSWORD` in
+   `.env.local`, then log in as that account and ingest your documents. The API requires a
+   signed-in user and Row Level Security scopes retrieval to the user's own documents, so the
+   harness signs in as that account and only sees what it owns.
 3. Copy `dataset.example.json` to `dataset.json` and write 10–20 real
    question/answer pairs about those documents. Include at least one
    unanswerable question to test refusal behavior.
